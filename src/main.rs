@@ -1,23 +1,45 @@
-use std::f32::consts::{PI, TAU};
-use std::fmt;
+mod export;
+mod save;
 
-use iced::alignment::Horizontal;
+use std::collections::VecDeque;
+use std::f32::consts::{FRAC_PI_2, PI, TAU};
+use std::ffi::OsStr;
+use std::fmt;
+use std::fs;
+use std::io;
+use std::iter;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::Arc;
+
+use iced::advanced::mouse::{Click, click};
+use iced::advanced::text::{self as advanced_text, Paragraph as _};
+use iced::alignment::{Horizontal, Vertical};
+use iced::keyboard::key::Named;
 use iced::time::{Duration, Instant};
 use iced::widget::canvas::{self, Canvas, Event, Geometry};
+use iced::widget::text::LineHeight;
 use iced::widget::{
-    Column, Row, button, column, container, pick_list, row, rule, scrollable, text, text_input,
+    Column, Row, Stack, button, checkbox, column, container, image, pick_list, row, rule,
+    scrollable, sensor, space, text, text_input,
 };
 use iced::{
-    Center, Color, Element, Fill, Point, Rectangle, Renderer, Size, Subscription, Theme, Vector,
-    keyboard, mouse, window,
+    Border, Center, Color, Element, Fill, Font, Point, Radians, Rectangle, Renderer, Size,
+    Subscription, Task, Theme, Vector, event, keyboard, mouse, window,
 };
+use resvg::{tiny_skia, usvg};
+
+use export::ImageFile;
+
+const THEME: Theme = Theme::Dark;
 
 fn main() -> iced::Result {
-    iced::application(Parousi::default, Parousi::update, Parousi::view)
+    // A daemon rather than an application, so the about window can open
+    // beside the main one.
+    iced::daemon(Parousi::new, Parousi::update, Parousi::view)
         .subscription(Parousi::subscription)
-        .title("Parousi")
-        .theme(Theme::Dark)
-        .window_size((1280.0, 800.0))
+        .title(Parousi::title)
+        .theme(THEME)
         .run()
 }
 
@@ -43,20 +65,32 @@ impl fmt::Display for Mode {
     }
 }
 
+/// What dragging and clicking on the board does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 enum Tool {
+    /// Picks an item to move or delete. Dragging elsewhere moves the camera.
     #[default]
     Select,
+    /// Moves the camera, even over items.
     Pan,
     Line,
     Arrow,
+    /// Spans the rectangle dragged over.
     Rectangle,
+    /// Fits the ellipse in the rectangle dragged over.
     Ellipse,
+    /// Draws a regular polygon of [`Corners`] from its center.
     Polygon,
+    /// Draws a star of [`Corners`] points from its center.
     Star,
+    /// Draws freehand.
     Pencil,
+    /// Draws straight segments between clicks.
     Path,
+    /// Writes text where clicked.
     Text,
+    /// Places an image in the area dragged over, or a default area around
+    /// the click.
     Image,
 }
 
@@ -79,6 +113,87 @@ impl fmt::Display for Tool {
     }
 }
 
+/// How to use the app, by topic, as the about window tells it.
+const USAGE: [(&str, &[&str]); 8] = [
+    (
+        "Drawing",
+        &[
+            "Pick a tool under Objects and drag on the board to draw with it.",
+            "Polygons and stars get their corners from the input under the shapes.",
+            "Path: click to add points. Double-click or press Enter to finish, click the first \
+             point to close it, or press Escape to drop it.",
+            "Text: click where it goes and type. Press Escape or click elsewhere to finish.",
+            "Image: drag out an area, or just click, then pick a file.",
+            "New items are drawn in the color picked under Color, or typed in as #rrggbb.",
+        ],
+    ),
+    (
+        "Editing",
+        &[
+            "With Select, click an item to select it, and drag it to move it.",
+            "Drag a square handle to resize it. Shift keeps its proportions.",
+            "Drag the round handle to turn it. Shift turns it in 15° steps.",
+            "Delete or Backspace deletes the selected item, and Escape deselects it.",
+        ],
+    ),
+    (
+        "Camera",
+        &[
+            "The camera belongs to the selected frame: moving it changes that frame's view.",
+            "Drag the board away from items, or anywhere with Pan, to move it.",
+            "In Rotate mode, dragging turns it around the center instead.",
+            "Ctrl + scroll zooms in and out around the cursor.",
+        ],
+    ),
+    (
+        "Turning slowly",
+        &[
+            "Turning the camera or an item slowly stops it at right angles, so it's easy to \
+             set straight. Drag a little further to go on. Turning fast goes right through.",
+        ],
+    ),
+    (
+        "Frames",
+        &[
+            "Each frame in the timeline is a view of the board. The presentation shows them \
+             one after another.",
+            "+ adds a frame after the selected one, starting from its view. Delete removes \
+             the selected frame.",
+            "Between two frames, pick how the camera moves from one to the next, and how many \
+             seconds it takes. Click a frame to go to it the same way.",
+        ],
+    ),
+    (
+        "Board",
+        &[
+            "Set the size of the board in the toolbar. With Aspect ratio ticked, changing one \
+             side changes the other to match.",
+            "Background puts an image behind the board, five times as wide as it, and \
+             Remove takes it away. Set its size beside them: changing one side changes the other, so the image keeps \
+             its proportions.",
+            "Depth sets how far behind the board the background is. The further it is, the \
+             slower it moves as the camera does. At 0, it moves with the board.",
+        ],
+    ),
+    (
+        "Saving",
+        &[
+            "Save keeps the presentation in a .parousi file, asking where the first time, and \
+             Open opens one to go on editing it.",
+            "Ctrl+S saves, Ctrl+Shift+S saves to another file, and Ctrl+O opens.",
+        ],
+    ),
+    (
+        "Presenting",
+        &[
+            "Export turns the presentation into a single web page.",
+            "Open it in a browser, and step through the frames with the arrow keys, Page Up \
+             and Page Down, or the buttons on the page.",
+            "Ctrl+Z undoes, and Ctrl+Shift+Z or Ctrl+Y redoes.",
+        ],
+    ),
+];
+
 const PALETTE: [(&str, &[Tool]); 4] = [
     ("Selection", &[Tool::Select, Tool::Pan]),
     (
@@ -100,12 +215,24 @@ const PALETTE: [(&str, &[Tool]); 4] = [
 enum Message {
     AspectWidthChanged(String),
     AspectHeightChanged(String),
+    /// Enables or disables keeping the aspect ratio while resizing the
+    /// board.
+    AspectRatioToggled(bool),
+    BoardWidthChanged(String),
+    BoardHeightChanged(String),
     ModeSelected(Mode),
     ToolSelected(Tool),
+    /// A color from [`COLORS`] was picked to draw in.
+    ColorPicked(Color),
+    /// The color input was edited.
+    ColorInputChanged(String),
+    /// The corners input was edited.
+    CornersChanged(String),
     FrameSelected(usize),
     /// Moves the selected frame's camera by a screen offset.
     CameraMoved(Vector),
-    /// Turns the selected frame's camera, see [`Camera::rotate`].
+    /// Turns the selected frame's camera to this rotation, see
+    /// [`Camera::rotate`].
     CameraRotated(f32),
     /// Zooms the selected frame's camera, see [`Camera::zoom_at`].
     CameraZoomed {
@@ -114,9 +241,37 @@ enum Message {
     },
     /// The camera started being dragged.
     CameraGrabbed,
-    /// The camera stopped being dragged.
-    CameraReleased,
+    /// The camera or the selected item stopped being dragged.
+    Released,
     ItemDrawn(Item),
+    /// An item, or a handle of its outline, was clicked to select it, which
+    /// starts dragging it, or the selection was cleared.
+    ItemSelected(Option<usize>),
+    /// The selected item was moved, turned or resized into this, while
+    /// being dragged.
+    ItemEdited(Item),
+    /// Deletes the selected item.
+    DeleteItem,
+    /// Opens a file dialog to pick an image to place in an area of the
+    /// board.
+    PlaceImage(Rectangle),
+    /// The picked image has loaded, or failed to.
+    ImageLoaded {
+        area: Rectangle,
+        result: Result<Picture, image::Error>,
+    },
+    /// Opens a file dialog to pick the background image.
+    PickBackground,
+    /// The picked background image has loaded, or failed to. It is to be
+    /// `width` wide.
+    BackgroundLoaded {
+        width: f32,
+        result: Result<Picture, image::Error>,
+    },
+    RemoveBackground,
+    BackgroundWidthChanged(String),
+    BackgroundHeightChanged(String),
+    BackgroundDepthChanged(String),
     TransitionKindSelected {
         frame: usize,
         kind: TransitionKind,
@@ -127,63 +282,152 @@ enum Message {
     },
     /// A window frame is about to be drawn during a transition.
     Tick(Instant),
+    /// The workspace has been laid out with a new size.
+    WorkspaceResized(Size),
     Undo,
     Redo,
-    Preview,
+    /// Opens a file dialog to pick a presentation to open.
+    Open,
+    /// The picked presentation has been read, or failed to.
+    Opened(Result<(PathBuf, Box<Presentation>), Arc<io::Error>>),
+    /// Saves the presentation to its file, or asks for one without one.
     Save,
-    Reload,
-    New,
-    Settings,
+    /// Opens a file dialog to save the presentation to another file.
+    SaveAs,
+    /// The presentation has been saved to this file, or failed to.
+    Saved(Result<PathBuf, Arc<io::Error>>),
+    /// Opens a file dialog to export the presentation as a web page.
+    Export,
+    /// The exported page has been written, or failed to.
+    Exported(Result<(), Arc<io::Error>>),
+    /// Opens the about window, or brings it to the front.
     About,
+    WindowClosed(window::Id),
     DeleteFrame,
     AddFrame,
 }
 
 struct Parousi {
-    aspect_ratio: AspectRatio,
+    /// The editor's window, closing which quits.
+    main_window: window::Id,
+    about_window: Option<window::Id>,
+    board_size: BoardSize,
+    /// Whether resizing one side of the board resizes the other to keep the
+    /// aspect ratio, rather than changing it. Like the tool, it is how the
+    /// presentation is edited, so it isn't undone.
+    keep_aspect_ratio: bool,
     mode: Mode,
     tool: Tool,
+    ink: Ink,
+    corners: Corners,
     /// Never empty, so there is always a camera to edit.
     frames: Vec<Frame>,
     /// Index of the selected frame.
     frame: usize,
-    /// Shared by all frames.
+    /// Shared by all frames, in the order they are drawn.
     items: Vec<Item>,
+    /// Index of the item picked with [`Tool::Select`].
+    selected: Option<usize>,
+    /// An image behind the board, moving slower than it for a sense of
+    /// depth. See [`Camera::behind`]. Shared by all frames.
+    background: Option<Background>,
     /// Camera move to the selected frame, while a transition plays.
     flight: Option<Flight>,
     history: History,
+    /// Size of the workspace, whose view of each frame the exported
+    /// presentation shows.
+    workspace: Size,
+    /// File the presentation was opened from or last saved to, which saving
+    /// writes to.
+    path: Option<PathBuf>,
 }
 
-impl Default for Parousi {
-    fn default() -> Self {
-        Self {
-            aspect_ratio: AspectRatio::default(),
-            mode: Mode::default(),
-            tool: Tool::default(),
-            frames: vec![Frame::default()],
-            frame: 0,
-            items: Vec::new(),
-            flight: None,
-            history: History::default(),
-        }
-    }
+/// The presentation apart from how it is being edited, as saved and
+/// exported. It is taken as it is, so it can be written out while editing
+/// goes on.
+#[derive(Debug, Clone)]
+struct Presentation {
+    /// Size of the editor's workspace. The exported page shows what it shows
+    /// of each frame, scaled to fit the browser window.
+    view: Size,
+    board_size: BoardSize,
+    frames: Vec<Frame>,
+    items: Vec<Item>,
+    background: Option<Background>,
 }
 
 impl Parousi {
-    fn update(&mut self, message: Message) {
+    /// An empty presentation, and the task opening its window.
+    fn new() -> (Self, Task<Message>) {
+        let (main_window, open) = window::open(window::Settings {
+            size: Size::new(1280.0, 800.0),
+            ..window::Settings::default()
+        });
+
+        let parousi = Self {
+            main_window,
+            about_window: None,
+            board_size: BoardSize::default(),
+            keep_aspect_ratio: true,
+            mode: Mode::default(),
+            tool: Tool::default(),
+            ink: Ink::default(),
+            corners: Corners::default(),
+            frames: vec![Frame::default()],
+            frame: 0,
+            items: Vec::new(),
+            selected: None,
+            background: None,
+            flight: None,
+            history: History::default(),
+            workspace: Size::ZERO,
+            path: None,
+        };
+
+        (parousi, open.discard())
+    }
+
+    fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::AspectWidthChanged(width) => {
-                let from = self.aspect_ratio.clone();
-                let to = from.with_inputs(width, from.height.clone());
-                self.perform(Action::AspectRatio { from, to });
+                let from = self.board_size.clone();
+                let to = from.with_aspect_ratio(width, from.aspect_ratio.height.clone());
+                self.perform(Action::BoardSize { from, to });
             }
             Message::AspectHeightChanged(height) => {
-                let from = self.aspect_ratio.clone();
-                let to = from.with_inputs(from.width.clone(), height);
-                self.perform(Action::AspectRatio { from, to });
+                let from = self.board_size.clone();
+                let to = from.with_aspect_ratio(from.aspect_ratio.width.clone(), height);
+                self.perform(Action::BoardSize { from, to });
+            }
+            Message::AspectRatioToggled(keep) => {
+                // Resizing after toggling is an edit of its own.
+                self.history.seal();
+                self.keep_aspect_ratio = keep;
+            }
+            Message::BoardWidthChanged(width) => {
+                let from = self.board_size.clone();
+                let to = from.with_width(width, self.keep_aspect_ratio);
+                self.perform(Action::BoardSize { from, to });
+            }
+            Message::BoardHeightChanged(height) => {
+                let from = self.board_size.clone();
+                let to = from.with_height(height, self.keep_aspect_ratio);
+                self.perform(Action::BoardSize { from, to });
             }
             Message::ModeSelected(mode) => self.mode = mode,
-            Message::ToolSelected(tool) => self.tool = tool,
+            Message::ToolSelected(tool) => {
+                self.tool = tool;
+                // Only the select tool shows the selection.
+                if tool != Tool::Select {
+                    self.selected = None;
+                }
+            }
+            // Like the tool, the color and corners are how new items are
+            // drawn rather than part of the presentation, so they aren't
+            // undone.
+            Message::ColorPicked(color) => self.ink = Ink::new(color),
+            Message::ColorInputChanged(input) => self.ink.set_input(input),
+            Message::CornersChanged(input) => self.corners.set_input(input),
             Message::FrameSelected(frame) => {
                 // Editing the newly selected frame shouldn't merge into an
                 // earlier edit of it.
@@ -202,10 +446,10 @@ impl Parousi {
                     to,
                 });
             }
-            Message::CameraRotated(angle) => {
+            Message::CameraRotated(rotation) => {
                 let from = self.frames[self.frame].camera;
                 let mut to = from;
-                to.rotate(angle);
+                to.rotate(wrapped(rotation - from.rotation));
                 self.perform(Action::Camera {
                     frame: self.frame,
                     from,
@@ -224,11 +468,108 @@ impl Parousi {
             }
             // A drag undoes on its own, apart from any scrolling before or
             // after it.
-            Message::CameraGrabbed | Message::CameraReleased => self.history.seal(),
+            Message::CameraGrabbed | Message::Released => self.history.seal(),
             Message::ItemDrawn(item) => self.perform(Action::ItemAdded {
                 index: self.items.len(),
                 item,
             }),
+            Message::ItemSelected(selected) => {
+                self.history.seal();
+                self.selected = selected;
+            }
+            Message::ItemEdited(to) => {
+                if let Some(index) = self.selected {
+                    let from = self.items[index].clone();
+                    self.perform(Action::ItemChanged { index, from, to });
+                }
+            }
+            Message::DeleteItem => {
+                if let Some(index) = self.selected {
+                    self.perform(Action::ItemRemoved {
+                        index,
+                        item: self.items[index].clone(),
+                    });
+                }
+            }
+            Message::PlaceImage(area) => {
+                // As sharp as the image can show, once fitted in the area.
+                let scale = move |size| fit(size, area).width / size.width * MAX_ZOOM;
+
+                return pick_picture("Image", scale)
+                    .map(move |result| Message::ImageLoaded { area, result });
+            }
+            Message::ImageLoaded {
+                area,
+                result: Ok(picture),
+            } => self.perform(Action::ItemAdded {
+                index: self.items.len(),
+                item: Item::new(Shape::Image {
+                    bounds: fit(picture.size(), area),
+                    picture,
+                }),
+            }),
+            Message::ImageLoaded {
+                result: Err(error), ..
+            } => {
+                eprintln!("Couldn't load the image: {error}");
+            }
+            Message::PickBackground => {
+                let width = self.board_size.size.width * BACKGROUND_BOARD_WIDTHS;
+
+                return pick_picture("Background", move |size| background_scale(width, size))
+                    .map(move |result| Message::BackgroundLoaded { width, result });
+            }
+            Message::BackgroundLoaded {
+                width,
+                result: Ok(picture),
+            } => {
+                // A new image goes as deep as the one it replaces.
+                let depth = self
+                    .background
+                    .as_ref()
+                    .map_or(DEFAULT_BACKGROUND_DEPTH, |background| background.depth);
+
+                self.perform(Action::Background {
+                    from: self.background.clone(),
+                    to: Some(Background::new(picture, width, depth)),
+                });
+            }
+            Message::BackgroundLoaded {
+                result: Err(error), ..
+            } => {
+                eprintln!("Couldn't load the background: {error}");
+            }
+            Message::RemoveBackground => self.perform(Action::Background {
+                from: self.background.clone(),
+                to: None,
+            }),
+            Message::BackgroundWidthChanged(width) => {
+                if let Some(from) = &self.background {
+                    let to = from.with_width(width);
+                    self.perform(Action::Background {
+                        from: Some(from.clone()),
+                        to: Some(to),
+                    });
+                }
+            }
+            Message::BackgroundHeightChanged(height) => {
+                if let Some(from) = &self.background {
+                    let to = from.with_height(height);
+                    self.perform(Action::Background {
+                        from: Some(from.clone()),
+                        to: Some(to),
+                    });
+                }
+            }
+            Message::BackgroundDepthChanged(depth) => {
+                if let Some(from) = &self.background {
+                    let to = from.with_depth(depth);
+                    self.perform(Action::Background {
+                        from: Some(from.clone()),
+                        to: Some(to),
+                    });
+                }
+            }
             Message::TransitionKindSelected { frame, kind } => {
                 let from = self.frames[frame].transition.clone();
                 let to = Transition {
@@ -281,23 +622,180 @@ impl Parousi {
                     self.apply(action);
                 }
             }
-            Message::Preview
-            | Message::Save
-            | Message::Reload
-            | Message::New
-            | Message::Settings
-            | Message::About => {}
+            Message::WorkspaceResized(size) => self.workspace = size,
+            Message::Open => {
+                let dialog = rfd::AsyncFileDialog::new()
+                    .set_title("Open")
+                    .add_filter("Presentation", &[save::EXTENSION])
+                    .pick_file();
+
+                // Reading the images can take a while, so the file isn't read
+                // in `update`.
+                return Task::future(async move {
+                    let path = dialog.await?.path().to_owned();
+                    Some(
+                        save::open(&path)
+                            .map(|opened| (path, opened))
+                            .map_err(Arc::new),
+                    )
+                })
+                .and_then(Task::done)
+                .and_then(|(path, opened)| {
+                    opened
+                        .allocate()
+                        .map(move |presentation| Ok((path.clone(), Box::new(presentation?))))
+                })
+                .map(Message::Opened);
+            }
+            Message::Opened(Ok((path, presentation))) => {
+                // The workspace stays as big as the window, whatever it was
+                // when saved.
+                let Presentation {
+                    view: _,
+                    board_size,
+                    frames,
+                    items,
+                    background,
+                } = *presentation;
+
+                self.board_size = board_size;
+                self.frames = frames;
+                self.frame = 0;
+                self.items = items;
+                self.selected = None;
+                self.background = background;
+                self.flight = None;
+                // Undoing goes no further back than the opened presentation.
+                self.history = History::default();
+                self.path = Some(path);
+            }
+            Message::Opened(Err(error)) => {
+                eprintln!("Couldn't open the presentation: {error}");
+            }
+            Message::Save => return self.save(self.path.clone()),
+            Message::SaveAs => return self.save(None),
+            Message::Saved(Ok(path)) => self.path = Some(path),
+            Message::Saved(Err(error)) => {
+                eprintln!("Couldn't save the presentation: {error}");
+            }
+            Message::Export => {
+                let presentation = self.presentation();
+                let dialog = rfd::AsyncFileDialog::new()
+                    .set_title("Export")
+                    .add_filter("Web page", &["html", "htm"])
+                    .set_file_name("presentation.html")
+                    .save_file();
+
+                // Embedding the background can take a while, so the page
+                // isn't written in `update`.
+                return Task::future(async move {
+                    let file = dialog.await?;
+                    Some(presentation.export(file.path()).map_err(Arc::new))
+                })
+                .and_then(Task::done)
+                .map(Message::Exported);
+            }
+            Message::Exported(Ok(())) => {}
+            Message::Exported(Err(error)) => {
+                eprintln!("Couldn't export the presentation: {error}");
+            }
+            Message::About => {
+                if let Some(about) = self.about_window {
+                    return window::gain_focus(about);
+                }
+
+                let (about, open) = window::open(window::Settings {
+                    size: Size::new(560.0, 680.0),
+                    min_size: Some(Size::new(360.0, 280.0)),
+                    ..window::Settings::default()
+                });
+                self.about_window = Some(about);
+                return open.discard();
+            }
+            Message::WindowClosed(window) => {
+                if window == self.main_window {
+                    return iced::exit();
+                }
+
+                if self.about_window == Some(window) {
+                    self.about_window = None;
+                }
+            }
         }
+
+        Task::none()
     }
 
     fn subscription(&self) -> Subscription<Message> {
-        let shortcuts = keyboard::listen().filter_map(shortcut);
+        // Only keys pressed in the main window, so they don't edit the
+        // presentation from the about window.
+        let shortcuts = event::listen_with(|event, status, window| match (event, status) {
+            (Event::Keyboard(event), event::Status::Ignored) => Some((window, event)),
+            _ => None,
+        })
+        .with(self.main_window)
+        .filter_map(|(main, (window, event))| (window == main).then(|| shortcut(event))?);
+
+        let closed = window::close_events().map(Message::WindowClosed);
 
         if self.flight.is_some() {
-            Subscription::batch([shortcuts, window::frames().map(Message::Tick)])
+            Subscription::batch([shortcuts, closed, window::frames().map(Message::Tick)])
         } else {
-            shortcuts
+            Subscription::batch([shortcuts, closed])
         }
+    }
+
+    fn title(&self, window: window::Id) -> String {
+        if self.about_window == Some(window) {
+            String::from("About Parousi")
+        } else if let Some(name) = self.path.as_deref().and_then(Path::file_stem) {
+            format!("{} — Parousi", name.to_string_lossy())
+        } else {
+            String::from("Parousi")
+        }
+    }
+
+    /// The presentation as it is now, to write out.
+    fn presentation(&self) -> Presentation {
+        Presentation {
+            view: self.workspace,
+            board_size: self.board_size.clone(),
+            frames: self.frames.clone(),
+            items: self.items.clone(),
+            background: self.background.clone(),
+        }
+    }
+
+    /// Saves the presentation to `path`, or to a file asked for without one.
+    fn save(&self, path: Option<PathBuf>) -> Task<Message> {
+        let mut dialog = rfd::AsyncFileDialog::new()
+            .set_title("Save")
+            .add_filter("Presentation", &[save::EXTENSION])
+            .set_file_name(format!("presentation.{}", save::EXTENSION));
+
+        // Starting from the presentation's file, if it has one.
+        if let Some(current) = &self.path
+            && let (Some(directory), Some(name)) = (current.parent(), current.file_name())
+        {
+            dialog = dialog
+                .set_directory(directory)
+                .set_file_name(name.to_string_lossy());
+        }
+
+        let presentation = self.presentation();
+
+        // Writing the images can take a while, so the file isn't written in
+        // `update`.
+        Task::future(async move {
+            let path = match path {
+                Some(path) => path,
+                None => dialog.save_file().await?.path().to_owned(),
+            };
+
+            Some(presentation.save(&path).map(|()| path).map_err(Arc::new))
+        })
+        .and_then(Task::done)
+        .map(Message::Saved)
     }
 
     /// Applies `action` and records it, so it can be undone.
@@ -313,7 +811,8 @@ impl Parousi {
     /// Applies `action` to the presentation, selecting the frame it changes.
     fn apply(&mut self, action: Action) {
         match action {
-            Action::AspectRatio { to, .. } => self.aspect_ratio = to,
+            Action::BoardSize { to, .. } => self.board_size = to,
+            Action::Background { to, .. } => self.background = to,
             Action::Camera { frame, to, .. } => {
                 // Lands any transition, so the camera shows the edit.
                 self.flight = None;
@@ -321,10 +820,24 @@ impl Parousi {
                 self.frames[frame].camera = to;
             }
             Action::Transition { frame, to, .. } => self.frames[frame].transition = to,
-            Action::ItemAdded { index, item } => self.items.insert(index, item),
+            // The selection stays on the same item as others come and go.
+            Action::ItemAdded { index, item } => {
+                self.items.insert(index, item);
+                if let Some(selected) = &mut self.selected
+                    && *selected >= index
+                {
+                    *selected += 1;
+                }
+            }
             Action::ItemRemoved { index, .. } => {
                 self.items.remove(index);
+                self.selected = match self.selected {
+                    Some(selected) if selected == index => None,
+                    Some(selected) if selected > index => Some(selected - 1),
+                    selected => selected,
+                };
             }
+            Action::ItemChanged { index, to, .. } => self.items[index] = to,
             Action::FrameAdded { index, frame } => {
                 self.frames.insert(index, frame);
                 self.frame = index;
@@ -366,7 +879,17 @@ impl Parousi {
         self.flight.map_or(camera, |flight| flight.camera(camera))
     }
 
-    fn view(&self) -> Element<'_, Message> {
+    fn board(&self) -> Board {
+        Board {
+            size: self.board_size.size,
+        }
+    }
+
+    fn view(&self, window: window::Id) -> Element<'_, Message> {
+        if self.about_window == Some(window) {
+            return self.about();
+        }
+
         column![
             row![self.workspace(), self.palette()].height(Fill),
             rule::horizontal(1),
@@ -377,22 +900,97 @@ impl Parousi {
         .into()
     }
 
+    /// What Parousi is, and how to use it.
+    fn about(&self) -> Element<'_, Message> {
+        let sections = USAGE.iter().map(|(title, lines)| {
+            column![
+                text(*title).size(16),
+                Column::with_children(lines.iter().map(|&line| text(line).into())).spacing(6),
+            ]
+            .spacing(8)
+            .into()
+        });
+
+        scrollable(
+            column![
+                column![
+                    text("Parousi").size(28),
+                    text(concat!("Version ", env!("CARGO_PKG_VERSION")))
+                        .size(14)
+                        .style(text::secondary),
+                ]
+                .spacing(4),
+                text(
+                    "Draw on a board, then present it as a series of views of it, with the \
+                     camera moving, zooming and turning from one to the next."
+                ),
+                rule::horizontal(1),
+                Column::with_children(sections).spacing(20),
+            ]
+            .spacing(16)
+            .padding(24),
+        )
+        .into()
+    }
+
     fn workspace(&self) -> Element<'_, Message> {
-        let board = BoardView {
-            board: Board::new(self.aspect_ratio.value),
-            camera: self.camera(),
-            items: &self.items,
-            mode: self.mode,
-            tool: self.tool,
+        let camera = self.camera();
+        let board = self.board();
+
+        // A canvas draws its images over its shapes, so the background gets a
+        // canvas of its own, under the board's. Likewise, the items are split
+        // into runs that a canvas each draws in order, see
+        // [`Item::shares_canvas`].
+        let background = self.background.as_ref().map(|background| {
+            Canvas::new(BackgroundView { background, camera })
+                .width(Fill)
+                .height(Fill)
+                .into()
+        });
+
+        let board_view = BoardView {
+            board,
+            camera,
+            see_through: self.background.is_some(),
         };
 
-        container(Canvas::new(board).width(Fill).height(Fill))
-            .width(Fill)
-            .height(Fill)
-            .style(|theme: &Theme| {
-                container::background(theme.extended_palette().background.weakest.color)
-            })
-            .into()
+        let items = self.items.chunk_by(Item::shares_canvas).map(|items| {
+            Canvas::new(ItemsView { camera, items })
+                .width(Fill)
+                .height(Fill)
+                .into()
+        });
+
+        // On top, so what is being drawn shows over everything.
+        let tool = ToolView {
+            board,
+            camera,
+            items: &self.items,
+            selected: self.selected,
+            mode: self.mode,
+            tool: self.tool,
+            color: self.ink.color,
+            corners: self.corners.count,
+        };
+
+        let layers = Stack::with_children(
+            background
+                .into_iter()
+                .chain([Canvas::new(board_view).width(Fill).height(Fill).into()])
+                .chain(items)
+                .chain([Canvas::new(tool).width(Fill).height(Fill).into()]),
+        )
+        .width(Fill)
+        .height(Fill);
+
+        sensor(
+            container(layers)
+                .width(Fill)
+                .height(Fill)
+                .style(|theme: &Theme| container::background(workspace_color(theme))),
+        )
+        .on_resize(Message::WorkspaceResized)
+        .into()
     }
 
     fn palette(&self) -> Element<'_, Message> {
@@ -403,9 +1001,12 @@ impl Parousi {
                     .into()
             });
 
+            // Under the tools it sets the corners of.
+            let corners = tools.contains(&Tool::Polygon).then(|| self.corners_input());
+
             column![
                 text(*title).size(14),
-                Column::with_children(rows).spacing(8)
+                Column::with_children(rows.chain(corners)).spacing(8)
             ]
             .spacing(8)
             .into()
@@ -417,7 +1018,7 @@ impl Parousi {
                     .size(20)
                     .width(Fill)
                     .align_x(Horizontal::Center),
-                Column::with_children(sections).spacing(20),
+                Column::with_children(sections.chain([self.color_picker()])).spacing(20),
             ]
             .spacing(16)
             .padding(16),
@@ -442,15 +1043,112 @@ impl Parousi {
             .into()
     }
 
+    /// The preset colors to draw in, and an input for any other.
+    fn color_picker(&self) -> Element<'_, Message> {
+        let swatches = COLORS.chunks(6).map(|colors| {
+            Row::with_children(colors.iter().map(|&color| self.swatch(color)))
+                .spacing(8)
+                .into()
+        });
+
+        let color = self.ink.color;
+        let shown = container(space())
+            .width(30)
+            .height(30)
+            .style(move |theme: &Theme| container::Style {
+                background: Some(color.into()),
+                border: swatch_border(theme),
+                ..container::Style::default()
+            });
+
+        let input = text_input("#rrggbb", &self.ink.input)
+            .on_input(Message::ColorInputChanged)
+            .style(input_style(self.ink.is_valid()));
+
+        column![
+            text("Color").size(14),
+            Column::with_children(swatches).spacing(8),
+            row![shown, input].spacing(8).align_y(Center),
+        ]
+        .spacing(8)
+        .into()
+    }
+
+    /// Input of the corners of polygons and points of stars, which only
+    /// they use.
+    fn corners_input(&self) -> Element<'_, Message> {
+        let input = text_input("", &self.corners.input)
+            .on_input_maybe(
+                matches!(self.tool, Tool::Polygon | Tool::Star).then_some(Message::CornersChanged),
+            )
+            .style(input_style(self.corners.is_valid()));
+
+        row![text("Corners"), input]
+            .spacing(8)
+            .align_y(Center)
+            .into()
+    }
+
+    fn swatch(&self, color: Color) -> Element<'_, Message> {
+        let is_picked = self.ink.color == color;
+
+        button(space())
+            .width(Fill)
+            .height(30)
+            .padding(0)
+            .style(move |theme: &Theme, status| {
+                let border = if is_picked {
+                    // Contrasting with the swatch rather than the panel shows
+                    // on any color.
+                    let ring = if color.relative_luminance() > 0.4 {
+                        Color::BLACK
+                    } else {
+                        Color::WHITE
+                    };
+                    swatch_border(theme).color(ring).width(3)
+                } else if status == button::Status::Hovered {
+                    swatch_border(theme).color(theme.extended_palette().background.base.text)
+                } else {
+                    swatch_border(theme)
+                };
+
+                button::Style {
+                    background: Some(color.into()),
+                    border,
+                    ..button::Style::default()
+                }
+            })
+            .on_press(Message::ColorPicked(color))
+            .into()
+    }
+
     fn toolbar(&self) -> Element<'_, Message> {
+        // The aspect ratio can only be typed in while it is kept, as it
+        // follows the size otherwise.
+        let keep = self.keep_aspect_ratio;
         let aspect_ratio = row![
-            text("Aspect ratio:"),
-            text_input("", &self.aspect_ratio.width)
-                .on_input(Message::AspectWidthChanged)
+            checkbox(keep)
+                .label("Aspect ratio:")
+                .on_toggle(Message::AspectRatioToggled),
+            text_input("", &self.board_size.aspect_ratio.width)
+                .on_input_maybe(keep.then_some(Message::AspectWidthChanged))
                 .width(60),
             text(":"),
-            text_input("", &self.aspect_ratio.height)
-                .on_input(Message::AspectHeightChanged)
+            text_input("", &self.board_size.aspect_ratio.height)
+                .on_input_maybe(keep.then_some(Message::AspectHeightChanged))
+                .width(60),
+        ]
+        .spacing(6)
+        .align_y(Center);
+
+        let size = row![
+            text("Size:"),
+            text_input("", &self.board_size.width)
+                .on_input(Message::BoardWidthChanged)
+                .width(60),
+            text("×"),
+            text_input("", &self.board_size.height)
+                .on_input(Message::BoardHeightChanged)
                 .width(60),
         ]
         .spacing(6)
@@ -474,26 +1172,65 @@ impl Parousi {
         ]
         .spacing(2);
 
-        let presentation = action_button("Preview", Message::Preview);
-
         let file = row![
+            action_button("Open", Message::Open),
             action_button("Save", Message::Save),
-            action_button("Reload", Message::Reload),
-            action_button("New", Message::New),
+            action_button("Export", Message::Export),
         ]
         .spacing(2);
 
-        let misc = row![
-            action_button("Settings", Message::Settings),
+        let has_background = self.background.is_some();
+        let background_side =
+            |side: fn(&Background) -> &str| self.background.as_ref().map_or("", side);
+
+        let background = row![
+            row![
+                action_button("Background", Message::PickBackground),
+                action_button(
+                    "Remove",
+                    has_background.then_some(Message::RemoveBackground)
+                ),
+            ]
+            .spacing(2),
+            row![
+                text("Size:"),
+                text_input("", background_side(|background| &background.width))
+                    .on_input_maybe(has_background.then_some(Message::BackgroundWidthChanged))
+                    .width(70),
+                text("×"),
+                text_input("", background_side(|background| &background.height))
+                    .on_input_maybe(has_background.then_some(Message::BackgroundHeightChanged))
+                    .width(70),
+            ]
+            .spacing(6)
+            .align_y(Center),
+            row![
+                text("Depth:"),
+                text_input("", background_side(|background| &background.depth_input))
+                    .on_input_maybe(has_background.then_some(Message::BackgroundDepthChanged))
+                    .width(50),
+            ]
+            .spacing(6)
+            .align_y(Center),
+        ]
+        .spacing(12)
+        .align_y(Center);
+
+        row![
+            row![aspect_ratio, size].spacing(16).align_y(Center),
+            background,
+            modes,
+            history,
+            file,
             action_button("About", Message::About),
         ]
-        .spacing(2);
-
-        row![aspect_ratio, modes, history, presentation, file, misc]
-            .spacing(24)
-            .padding([8, 16])
-            .align_y(Center)
-            .into()
+        .spacing(24)
+        .padding([8, 16])
+        .align_y(Center)
+        // Onto more lines in a narrow window, rather than cutting it off.
+        .wrap()
+        .vertical_spacing(8)
+        .into()
     }
 
     fn timeline(&self) -> Element<'_, Message> {
@@ -570,6 +1307,40 @@ impl Parousi {
     }
 }
 
+/// Color around the board, where neither it nor the background is.
+fn workspace_color(theme: &Theme) -> Color {
+    theme.extended_palette().background.weakest.color
+}
+
+/// Outline of a color swatch, which shows it apart from the panel even when
+/// they are alike.
+fn swatch_border(theme: &Theme) -> Border {
+    Border {
+        color: theme.extended_palette().background.strong.color,
+        width: 1.0,
+        radius: 4.0.into(),
+    }
+}
+
+/// Style of a text input, outlined in red while it doesn't hold a valid
+/// value.
+fn input_style(is_valid: bool) -> impl Fn(&Theme, text_input::Status) -> text_input::Style {
+    move |theme, status| {
+        let style = text_input::default(theme, status);
+
+        if is_valid {
+            style
+        } else {
+            text_input::Style {
+                border: style
+                    .border
+                    .color(theme.extended_palette().danger.base.color),
+                ..style
+            }
+        }
+    }
+}
+
 /// A toolbar button, disabled without a message.
 fn action_button(label: &str, message: impl Into<Option<Message>>) -> Element<'_, Message> {
     button(text(label))
@@ -590,8 +1361,14 @@ fn shortcut(event: keyboard::Event) -> Option<Message> {
         return None;
     };
 
+    // Only keys nothing else took get here, so these don't fire while
+    // typing.
     if !modifiers.command() {
-        return None;
+        return match key.as_ref() {
+            keyboard::Key::Named(Named::Delete | Named::Backspace) => Some(Message::DeleteItem),
+            keyboard::Key::Named(Named::Escape) => Some(Message::ItemSelected(None)),
+            _ => None,
+        };
     }
 
     // Matching the latin letter keeps the shortcuts on the same keys in
@@ -599,8 +1376,119 @@ fn shortcut(event: keyboard::Event) -> Option<Message> {
     match (key.to_latin(physical_key)?, modifiers.shift()) {
         ('z', false) => Some(Message::Undo),
         ('z', true) | ('y', false) => Some(Message::Redo),
+        ('s', false) => Some(Message::Save),
+        ('s', true) => Some(Message::SaveAs),
+        ('o', false) => Some(Message::Open),
         _ => None,
     }
+}
+
+/// The board's size and aspect ratio, as typed into their inputs.
+#[derive(Debug, Clone, PartialEq)]
+struct BoardSize {
+    width: String,
+    height: String,
+    /// In whole board units. The inputs may not form a valid size (e.g.
+    /// mid-edit), in which case this keeps the last valid one.
+    size: Size,
+    /// Kept by the size while keeping the aspect ratio, and following it
+    /// otherwise.
+    aspect_ratio: AspectRatio,
+}
+
+impl Default for BoardSize {
+    fn default() -> Self {
+        let size = Size::new(640.0, 480.0);
+
+        Self {
+            width: size.width.to_string(),
+            height: size.height.to_string(),
+            size,
+            aspect_ratio: AspectRatio::of(size),
+        }
+    }
+}
+
+impl BoardSize {
+    /// With the width input set to `input`. Keeping the aspect ratio, the
+    /// height follows the width.
+    fn with_width(&self, input: String, keep_aspect_ratio: bool) -> Self {
+        let mut next = Self {
+            width: input,
+            ..self.clone()
+        };
+
+        if let Some(width) = parse_side(&next.width) {
+            next.size.width = width;
+
+            if keep_aspect_ratio {
+                next.size.height = round_side(width / self.aspect_ratio.value);
+                next.height = next.size.height.to_string();
+            } else {
+                next.aspect_ratio = AspectRatio::of(next.size);
+            }
+        }
+
+        next
+    }
+
+    /// With the height input set to `input`. Keeping the aspect ratio, the
+    /// width follows the height.
+    fn with_height(&self, input: String, keep_aspect_ratio: bool) -> Self {
+        let mut next = Self {
+            height: input,
+            ..self.clone()
+        };
+
+        if let Some(height) = parse_side(&next.height) {
+            next.size.height = height;
+
+            if keep_aspect_ratio {
+                next.size.width = round_side(height * self.aspect_ratio.value);
+                next.width = next.size.width.to_string();
+            } else {
+                next.aspect_ratio = AspectRatio::of(next.size);
+            }
+        }
+
+        next
+    }
+
+    /// With the aspect ratio inputs set, which the width follows.
+    fn with_aspect_ratio(&self, width: String, height: String) -> Self {
+        let mut next = Self {
+            aspect_ratio: self.aspect_ratio.with_inputs(width, height),
+            ..self.clone()
+        };
+
+        next.size.width = round_side(next.size.height * next.aspect_ratio.value);
+        next.width = next.size.width.to_string();
+        next
+    }
+}
+
+/// Parses a side of the board, a positive whole number of board units.
+fn parse_side(input: &str) -> Option<f32> {
+    input
+        .parse::<u32>()
+        .ok()
+        .filter(|&side| side > 0)
+        .map(|side| side as f32)
+}
+
+/// A background depth, which can be any distance behind the board, but not
+/// in front of it.
+fn parse_depth(input: &str) -> Option<f32> {
+    input
+        .parse::<f32>()
+        .ok()
+        .filter(|depth| depth.is_finite() && *depth >= 0.0)
+}
+
+/// Rounds a side of the board worked out from the other to whole board
+/// units, at least one.
+fn round_side(side: f32) -> f32 {
+    side.round().max(1.0)
 }
 
 /// The board's aspect ratio, as typed into its two inputs.
@@ -613,17 +1501,19 @@ struct AspectRatio {
     value: f32,
 }
 
-impl Default for AspectRatio {
-    fn default() -> Self {
+impl AspectRatio {
+    /// The aspect ratio of `size`, whose sides are whole, in lowest terms.
+    fn of(size: Size) -> Self {
+        let (width, height) = (size.width as u32, size.height as u32);
+        let divisor = gcd(width, height);
+
         Self {
-            width: String::from("4"),
-            height: String::from("3"),
-            value: 4.0 / 3.0,
+            width: (width / divisor).to_string(),
+            height: (height / divisor).to_string(),
+            value: size.width / size.height,
         }
     }
-}
 
-impl AspectRatio {
     fn with_inputs(&self, width: String, height: String) -> Self {
         let value = match (width.parse::<f32>(), height.parse::<f32>()) {
             (Ok(w), Ok(h)) if w > 0.0 && h > 0.0 && (w / h).is_normal() => w / h,
@@ -638,13 +1528,22 @@ impl AspectRatio {
     }
 }
 
+/// Greatest common divisor of `a` and `b`.
+fn gcd(a: u32, b: u32) -> u32 {
+    if b == 0 { a } else { gcd(b, a % b) }
+}
+
 /// An undoable edit of the presentation, holding enough to apply it either
 /// way.
 #[derive(Debug, Clone)]
 enum Action {
-    AspectRatio {
-        from: AspectRatio,
-        to: AspectRatio,
+    BoardSize {
+        from: BoardSize,
+        to: BoardSize,
+    },
+    Background {
+        from: Option<Background>,
+        to: Option<Background>,
     },
     Camera {
         frame: usize,
@@ -664,6 +1563,11 @@ enum Action {
         index: usize,
         item: Item,
     },
+    ItemChanged {
+        index: usize,
+        from: Item,
+        to: Item,
+    },
     FrameAdded {
         index: usize,
         frame: Frame,
@@ -678,7 +1582,8 @@ impl Action {
     /// The action that takes this one back.
     fn inverse(&self) -> Action {
         match self.clone() {
-            Action::AspectRatio { from, to } => Action::AspectRatio { from: to, to: from },
+            Action::BoardSize { from, to } => Action::BoardSize { from: to, to: from },
+            Action::Background { from, to } => Action::Background { from: to, to: from },
             Action::Camera { frame, from, to } => Action::Camera {
                 frame,
                 from: to,
@@ -691,6 +1596,11 @@ impl Action {
             },
             Action::ItemAdded { index, item } => Action::ItemRemoved { index, item },
             Action::ItemRemoved { index, item } => Action::ItemAdded { index, item },
+            Action::ItemChanged { index, from, to } => Action::ItemChanged {
+                index,
+                from: to,
+                to: from,
+            },
             Action::FrameAdded { index, frame } => Action::FrameDeleted { index, frame },
             Action::FrameDeleted { index, frame } => Action::FrameAdded { index, frame },
         }
@@ -700,9 +1610,11 @@ impl Action {
     /// zooming in past the limit).
     fn is_noop(&self) -> bool {
         match self {
-            Action::AspectRatio { from, to } => from == to,
+            Action::BoardSize { from, to } => from == to,
+            Action::Background { from, to } => from == to,
             Action::Camera { from, to, .. } => from == to,
             Action::Transition { from, to, .. } => from == to,
+            Action::ItemChanged { from, to, .. } => from == to,
             Action::ItemAdded { .. }
             | Action::ItemRemoved { .. }
             | Action::FrameAdded { .. }
@@ -715,7 +1627,24 @@ impl Action {
     /// Returns whether it did.
     fn merge(&mut self, next: &Action) -> bool {
         match (self, next) {
-            (Action::AspectRatio { to, .. }, Action::AspectRatio { to: next, .. }) => {
+            (Action::BoardSize { to, .. }, Action::BoardSize { to: next, .. }) => {
+                *to = next.clone();
+            }
+            // Typing a background's size or depth merges, but picking or
+            // removing the background is a step of its own.
+            (
+                Action::Background {
+                    from: Some(from),
+                    to: Some(to),
+                },
+                Action::Background {
+                    from: Some(next_from),
+                    to: Some(next),
+                },
+            ) if from.picture == to.picture
+                && next_from.picture == next.picture
+                && to.picture == next.picture =>
+            {
                 *to = next.clone();
             }
             (
@@ -726,6 +1655,14 @@ impl Action {
                     ..
                 },
             ) if frame == next_frame => *to = *next,
+            (
+                Action::ItemChanged { index, to, .. },
+                Action::ItemChanged {
+                    index: next_index,
+                    to: next,
+                    ..
+                },
+            ) if index == next_index => *to = next.clone(),
             // Typing a duration merges, but picking a kind is a step of its
             // own.
             (
@@ -806,8 +1743,16 @@ impl History {
     }
 }
 
-/// Board height in board units; the width follows the aspect ratio.
-const BOARD_HEIGHT: f32 = 480.0;
+/// Fill of the board when no background shows through it.
+const BOARD_COLOR: Color = Color::WHITE;
+
+/// Lines, with their widths in screen pixels, outlining the board when the
+/// background shows through it. A light line over a dark one shows on any
+/// background.
+const BOARD_OUTLINE: [(Color, f32); 2] = [
+    (Color::from_rgba(0.0, 0.0, 0.0, 0.4), 3.0),
+    (Color::from_rgba(1.0, 1.0, 1.0, 0.8), 1.0),
+];
 
 const MIN_ZOOM: f32 = 0.1;
 const MAX_ZOOM: f32 = 10.0;
@@ -821,14 +1766,6 @@ const PIXELS_PER_LINE: f32 = 50.0;
 #[derive(Debug, Clone, Copy)]
 struct Board {
     size: Size,
-}
-
-impl Board {
-    fn new(aspect_ratio: f32) -> Self {
-        Self {
-            size: Size::new(BOARD_HEIGHT * aspect_ratio, BOARD_HEIGHT),
-        }
-    }
 }
 
 /// How the board is placed on the canvas. It is independent of the canvas
@@ -870,6 +1807,31 @@ impl Camera {
         self.zoom = zoom;
     }
 
+    /// The camera as seen from a plane `depth` behind the board (see
+    /// [`Background::depth`]), drawing in that plane's units.
+    ///
+    /// The camera is taken to hover `1 / zoom` above the board, so the plane
+    /// looks smaller by the ratio of their distances. Hence it pans and zooms
+    /// slower, the more so the closer the camera is to the board, but turns
+    /// all the same. As with real depth, the plane's point behind the board
+    /// point at the canvas center, or under a zoom anchor, stays behind it.
+    fn behind(self, depth: f32) -> Camera {
+        let zoom = 1.0 / (1.0 / self.zoom + depth);
+
+        Camera {
+            zoom,
+            rotation: self.rotation,
+            offset: self.offset * (zoom / self.zoom),
+        }
+    }
+
+    /// Makes `frame` draw in the coordinates the camera looks at.
+    fn apply(self, frame: &mut canvas::Frame) {
+        frame.translate(frame.center() - Point::ORIGIN + self.offset);
+        frame.rotate(self.rotation);
+        frame.scale(self.zoom);
+    }
+
     /// Converts a position relative to the canvas center to board
     /// coordinates.
     fn to_board(self, position: Vector) -> Point {
@@ -886,7 +1848,7 @@ impl Camera {
         let center = from_center + (to.to_board(Vector::ZERO) - from_center) * amount;
         let zoom = self.zoom * (to.zoom / self.zoom).powf(amount);
         // Between -π and π, as turning past half a turn is the long way.
-        let turn = (to.rotation - self.rotation + PI).rem_euclid(TAU) - PI;
+        let turn = wrapped(to.rotation - self.rotation);
         let rotation = (self.rotation + turn * amount).rem_euclid(TAU);
 
         Camera {
@@ -905,6 +1867,11 @@ fn rotated(vector: Vector, angle: f32) -> Vector {
         vector.x * cos - vector.y * sin,
         vector.x * sin + vector.y * cos,
     )
+}
+
+/// `angle` wrapped to between -π and π: the same turn, the short way round.
+fn wrapped(angle: f32) -> f32 {
+    (angle + PI).rem_euclid(TAU) - PI
 }
 
 /// The clockwise angle, between -π and π, that turns the direction of
@@ -1039,51 +2006,1722 @@ impl Flight {
     }
 }
 
-const LINE_COLOR: Color = Color::from_rgb8(0x25, 0x63, 0xEB);
-const LINE_WIDTH: f32 = 3.0;
+/// Colors offered in the palette, in rows of six.
+const COLORS: [Color; 12] = [
+    Color::from_rgb8(0x00, 0x00, 0x00),
+    Color::from_rgb8(0x6B, 0x72, 0x80),
+    Color::from_rgb8(0xFF, 0xFF, 0xFF),
+    Color::from_rgb8(0xDC, 0x26, 0x26),
+    Color::from_rgb8(0xEA, 0x58, 0x0C),
+    Color::from_rgb8(0xFA, 0xCC, 0x15),
+    Color::from_rgb8(0x16, 0xA3, 0x4A),
+    Color::from_rgb8(0x0D, 0x94, 0x88),
+    DEFAULT_COLOR,
+    Color::from_rgb8(0x93, 0x33, 0xEA),
+    Color::from_rgb8(0xDB, 0x27, 0x77),
+    Color::from_rgb8(0x92, 0x40, 0x0E),
+];
 
-/// Something drawn on the board. Positions are in board coordinates (board
-/// units relative to the board center), so items move and zoom with it.
-#[derive(Debug, Clone, Copy)]
-enum Item {
-    Line { from: Point, to: Point },
+const DEFAULT_COLOR: Color = Color::from_rgb8(0x25, 0x63, 0xEB);
+
+/// The color new items are drawn in.
+#[derive(Debug, Clone, PartialEq)]
+struct Ink {
+    color: Color,
+    /// Color input in hex (e.g. `#2563eb`, or `#2563eb80` with alpha). It
+    /// may not be a valid color (e.g. mid-edit), in which case `color` keeps
+    /// the last valid one.
+    input: String,
 }
 
-impl Item {
-    fn draw(&self, frame: &mut canvas::Frame) {
-        match *self {
-            Item::Line { from, to } => frame.stroke(
-                &canvas::Path::line(from, to),
-                canvas::Stroke::default()
-                    .with_color(LINE_COLOR)
-                    .with_width(LINE_WIDTH)
-                    .with_line_cap(canvas::LineCap::Round),
-            ),
+impl Default for Ink {
+    fn default() -> Self {
+        Self::new(DEFAULT_COLOR)
+    }
+}
+
+impl Ink {
+    fn new(color: Color) -> Self {
+        Self {
+            color,
+            input: color.to_string(),
+        }
+    }
+
+    fn set_input(&mut self, input: String) {
+        if let Some(color) = parse_color(&input) {
+            self.color = color;
+        }
+        self.input = input;
+    }
+
+    fn is_valid(&self) -> bool {
+        parse_color(&self.input).is_some()
+    }
+}
+
+/// Parses a hex color of 3, 4, 6 or 8 digits, with or without a `#`.
+fn parse_color(input: &str) -> Option<Color> {
+    let input = input.trim();
+    let hex = input.strip_prefix('#').unwrap_or(input);
+
+    // `Color`'s parser slices the digits by byte, which panics inside a
+    // multi-byte character.
+    if !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+
+    hex.parse().ok()
+}
+
+/// Fewest corners a polygon can have, and points a star.
+const MIN_CORNERS: usize = 3;
+const MAX_CORNERS: usize = 100;
+
+/// The corners new polygons have, and points new stars have.
+#[derive(Debug, Clone, PartialEq)]
+struct Corners {
+    count: usize,
+    /// Corners input. It may not be a valid count (e.g. mid-edit), in which
+    /// case `count` keeps the last valid one.
+    input: String,
+}
+
+impl Default for Corners {
+    fn default() -> Self {
+        Self {
+            count: 5,
+            input: String::from("5"),
         }
     }
 }
 
-/// Pointer state kept by the canvas between events.
+impl Corners {
+    fn set_input(&mut self, input: String) {
+        if let Some(count) = parse_corners(&input) {
+            self.count = count;
+        }
+        self.input = input;
+    }
+
+    fn is_valid(&self) -> bool {
+        parse_corners(&self.input).is_some()
+    }
+}
+
+fn parse_corners(input: &str) -> Option<usize> {
+    input
+        .trim()
+        .parse()
+        .ok()
+        .filter(|count| (MIN_CORNERS..=MAX_CORNERS).contains(count))
+}
+
+const LINE_WIDTH: f32 = 3.0;
+
+/// Length of an arrowhead along its arrow, and its width across it. It
+/// shrinks to fit an arrow shorter than it.
+const ARROW_HEAD_LENGTH: f32 = 15.0;
+const ARROW_HEAD_WIDTH: f32 = 12.0;
+
+/// Distance of a star's dents from its center, relative to its points'.
+const STAR_DENT: f32 = 0.5;
+
+/// Size of new text.
+const TEXT_SIZE: f32 = 32.0;
+
+/// Height of a line of text, relative to its size.
+const TEXT_LINE_HEIGHT: f32 = 1.2;
+
+/// Something drawn on the board, so it moves and zooms with it.
+#[derive(Debug, Clone, PartialEq)]
+struct Item {
+    /// In the item's own coordinates: board coordinates turned back by
+    /// `rotation` around the board center.
+    shape: Shape,
+    /// Clockwise turn of the item's own coordinates on the board, in
+    /// radians within a full turn.
+    rotation: f32,
+}
+
+impl Item {
+    /// An item with `shape` in board coordinates, not turned.
+    fn new(shape: Shape) -> Self {
+        Self {
+            shape,
+            rotation: 0.0,
+        }
+    }
+
+    fn draw(&self, frame: &mut canvas::Frame) {
+        frame.with_save(|frame| {
+            frame.rotate(self.rotation);
+            self.shape.draw(frame);
+        });
+    }
+
+    /// Converts a board point to the item's own coordinates.
+    fn to_local(&self, point: Point) -> Point {
+        Point::ORIGIN + rotated(point - Point::ORIGIN, -self.rotation)
+    }
+
+    /// Converts a point in the item's own coordinates to board coordinates.
+    fn to_board(&self, point: Point) -> Point {
+        Point::ORIGIN + rotated(point - Point::ORIGIN, self.rotation)
+    }
+
+    /// Whether `next` can be drawn by the same canvas as this item, after
+    /// it. A canvas draws its images over its shapes, and its text over both
+    /// (or as shapes, when turned), whatever order they come in, so only a
+    /// shape can be followed by another kind of item.
+    fn shares_canvas(&self, next: &Item) -> bool {
+        match (&self.shape, &next.shape) {
+            (Shape::Text { .. }, Shape::Text { .. })
+            | (Shape::Image { .. }, Shape::Image { .. }) => true,
+            (Shape::Text { .. } | Shape::Image { .. }, _) => false,
+            _ => true,
+        }
+    }
+
+    /// The item moved by `delta` on the board.
+    fn translated(&self, delta: Vector) -> Item {
+        Item {
+            shape: self.shape.translated(rotated(delta, -self.rotation)),
+            rotation: self.rotation,
+        }
+    }
+
+    /// Center of the item's extent on the board, which it turns around.
+    fn center(&self) -> Point {
+        self.to_board(self.shape.extent().center())
+    }
+
+    /// The item turned clockwise by `angle` radians around the board point
+    /// `center`.
+    fn turned(&self, center: Point, angle: f32) -> Item {
+        let rotation = (self.rotation + angle).rem_euclid(TAU);
+        // Turning around the board center instead moves `center` by this.
+        let center = center - Point::ORIGIN;
+        let drift = center - rotated(center, angle);
+
+        Item {
+            shape: self.shape.translated(rotated(drift, -rotation)),
+            rotation,
+        }
+    }
+
+    /// Whether `point` is on the drawn item, or within `distance` of it.
+    fn hits(&self, point: Point, distance: f32) -> bool {
+        self.shape.hits(self.to_local(point), distance)
+    }
+}
+
+/// What an item draws, in its own coordinates.
+#[derive(Debug, Clone, PartialEq)]
+enum Shape {
+    /// Straight segments through `points`, and back to the first one when
+    /// `closed`. Lines, rectangles, polygons, stars, pencil strokes and
+    /// paths are all drawn as these.
+    Polyline {
+        points: Vec<Point>,
+        closed: bool,
+        color: Color,
+    },
+    Arrow {
+        from: Point,
+        to: Point,
+        color: Color,
+    },
+    Ellipse {
+        center: Point,
+        radii: Vector,
+        color: Color,
+    },
+    /// Lines of text, with the top left corner of the first at `position`.
+    Text {
+        position: Point,
+        content: String,
+        size: f32,
+        color: Color,
+    },
+    Image {
+        bounds: Rectangle,
+        picture: Picture,
+    },
+}
+
+impl Shape {
+    fn draw(&self, frame: &mut canvas::Frame) {
+        match self {
+            Shape::Polyline {
+                points,
+                closed,
+                color,
+            } => frame.stroke(&polyline(points, *closed), stroke(*color)),
+            Shape::Arrow { from, to, color } => {
+                let (base, head) = arrow_head(*from, *to);
+                frame.stroke(&canvas::Path::line(*from, base), stroke(*color));
+                frame.fill(&polyline(&head, true), *color);
+            }
+            Shape::Ellipse {
+                center,
+                radii,
+                color,
+            } => {
+                let ellipse = canvas::Path::new(|builder| {
+                    builder.ellipse(canvas::path::arc::Elliptical {
+                        center: *center,
+                        radii: *radii,
+                        rotation: Radians(0.0),
+                        start_angle: Radians(0.0),
+                        end_angle: Radians(TAU),
+                    });
+                    builder.close();
+                });
+                frame.stroke(&ellipse, stroke(*color));
+            }
+            Shape::Text {
+                position,
+                content,
+                size,
+                color,
+            } => frame.fill_text(canvas::Text {
+                content: content.clone(),
+                position: *position,
+                color: *color,
+                size: (*size).into(),
+                line_height: LineHeight::Relative(TEXT_LINE_HEIGHT),
+                font: Font::DEFAULT,
+                ..canvas::Text::default()
+            }),
+            Shape::Image { bounds, picture } => {
+                frame.draw_image(*bounds, canvas::Image::new(picture.image.handle().clone()))
+            }
+        }
+    }
+
+    /// The shape moved by `delta`.
+    fn translated(&self, delta: Vector) -> Shape {
+        self.mapped(|point| point + delta, Vector::new(1.0, 1.0))
+    }
+
+    /// The shape stretched by `factors` along each axis, away from `anchor`,
+    /// which stays in place. Text only takes the horizontal factor, as it
+    /// [keeps its proportions](Self::keeps_proportions).
+    fn scaled(&self, anchor: Point, factors: Vector) -> Shape {
+        self.mapped(
+            |point| {
+                Point::new(
+                    anchor.x + (point.x - anchor.x) * factors.x,
+                    anchor.y + (point.y - anchor.y) * factors.y,
+                )
+            },
+            factors,
+        )
+    }
+
+    /// The shape with its points moved by `map`, which stretches lengths by
+    /// `factors`. Lines stay as thick.
+    fn mapped(&self, map: impl Fn(Point) -> Point, factors: Vector) -> Shape {
+        match self.clone() {
+            Shape::Polyline {
+                points,
+                closed,
+                color,
+            } => Shape::Polyline {
+                points: points.into_iter().map(map).collect(),
+                closed,
+                color,
+            },
+            Shape::Arrow { from, to, color } => Shape::Arrow {
+                from: map(from),
+                to: map(to),
+                color,
+            },
+            Shape::Ellipse {
+                center,
+                radii,
+                color,
+            } => Shape::Ellipse {
+                center: map(center),
+                radii: Vector::new(radii.x * factors.x, radii.y * factors.y),
+                color,
+            },
+            Shape::Text {
+                position,
+                content,
+                size,
+                color,
+            } => Shape::Text {
+                position: map(position),
+                content,
+                size: size * factors.x,
+                color,
+            },
+            Shape::Image { bounds, picture } => Shape::Image {
+                bounds: Rectangle::new(
+                    map(bounds.position()),
+                    Size::new(bounds.width * factors.x, bounds.height * factors.y),
+                ),
+                picture,
+            },
+        }
+    }
+
+    /// Whether the shape can only be resized evenly, as stretched text
+    /// looks broken.
+    fn keeps_proportions(&self) -> bool {
+        matches!(self, Shape::Text { .. })
+    }
+
+    /// The smallest rectangle the shape's points fit in, not counting the
+    /// thickness of lines or arrowheads, so it resizes with the shape.
+    fn extent(&self) -> Rectangle {
+        match self {
+            Shape::Polyline { points, .. } => enclosing(points.iter().copied()),
+            Shape::Arrow { from, to, .. } => enclosing([*from, *to]),
+            Shape::Ellipse { center, radii, .. } => {
+                Rectangle::new(*center - *radii, Size::new(radii.x, radii.y) * 2.0)
+            }
+            Shape::Text {
+                position,
+                content,
+                size,
+                ..
+            } => Rectangle::new(*position, text_size(content, *size)),
+            Shape::Image { bounds, .. } => *bounds,
+        }
+    }
+
+    /// Whether `point` is on the drawn shape, or within `distance` of it.
+    /// Shapes are hit inside too, as clicking their thin outline is hard.
+    fn hits(&self, point: Point, distance: f32) -> bool {
+        // Up to the edge of the stroke.
+        let reach = distance + LINE_WIDTH / 2.0;
+
+        match self {
+            Shape::Polyline { points, closed, .. } => {
+                segments(points, *closed).any(|(a, b)| distance_to_segment(point, a, b) <= reach)
+                    || *closed && encloses(points, point)
+            }
+            Shape::Arrow { from, to, .. } => {
+                let (_, head) = arrow_head(*from, *to);
+                distance_to_segment(point, *from, *to) <= reach || encloses(&head, point)
+            }
+            Shape::Ellipse { center, radii, .. } => {
+                let offset = point - *center;
+                (offset.x / (radii.x + reach)).powi(2) + (offset.y / (radii.y + reach)).powi(2)
+                    <= 1.0
+            }
+            Shape::Text { .. } | Shape::Image { .. } => {
+                self.extent().expand(distance).contains(point)
+            }
+        }
+    }
+}
+
+/// How items draw their outlines.
+fn stroke(color: Color) -> canvas::Stroke<'static> {
+    canvas::Stroke::default()
+        .with_color(color)
+        .with_width(LINE_WIDTH)
+        .with_line_cap(canvas::LineCap::Round)
+        .with_line_join(canvas::LineJoin::Round)
+}
+
+/// Straight segments through `points`, and back to the first one when
+/// `closed`.
+fn polyline(points: &[Point], closed: bool) -> canvas::Path {
+    canvas::Path::new(|builder| {
+        let Some((first, rest)) = points.split_first() else {
+            return;
+        };
+
+        builder.move_to(*first);
+        for point in rest {
+            builder.line_to(*point);
+        }
+        if closed {
+            builder.close();
+        }
+    })
+}
+
+/// The segments of a polyline through `points`, see [`Shape::Polyline`].
+fn segments(points: &[Point], closed: bool) -> impl Iterator<Item = (Point, Point)> + '_ {
+    let closing = match (points.first(), points.last()) {
+        (Some(&first), Some(&last)) if closed => Some((last, first)),
+        _ => None,
+    };
+
+    points
+        .windows(2)
+        .map(|pair| (pair[0], pair[1]))
+        .chain(closing)
+}
+
+fn distance_to_segment(point: Point, a: Point, b: Point) -> f32 {
+    let segment = b - a;
+    let length_squared = segment.x * segment.x + segment.y * segment.y;
+    // How far along the segment the closest point is, from 0 at `a` to 1 at
+    // `b`.
+    let along = if length_squared > 0.0 {
+        let offset = point - a;
+        ((offset.x * segment.x + offset.y * segment.y) / length_squared).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+
+    point.distance(a + segment * along)
+}
+
+/// Whether `point` is inside the polygon with corners `polygon`, by the
+/// even-odd rule.
+fn encloses(polygon: &[Point], point: Point) -> bool {
+    segments(polygon, true)
+        .filter(|(a, b)| {
+            (a.y > point.y) != (b.y > point.y)
+                && point.x < a.x + (point.y - a.y) / (b.y - a.y) * (b.x - a.x)
+        })
+        .count()
+        % 2
+        == 1
+}
+
+/// The smallest rectangle containing `points`.
+fn enclosing(points: impl IntoIterator<Item = Point>) -> Rectangle {
+    let (min, max) = points.into_iter().fold(
+        (
+            Point::new(f32::INFINITY, f32::INFINITY),
+            Point::new(f32::NEG_INFINITY, f32::NEG_INFINITY),
+        ),
+        |(min, max), point| {
+            (
+                Point::new(min.x.min(point.x), min.y.min(point.y)),
+                Point::new(max.x.max(point.x), max.y.max(point.y)),
+            )
+        },
+    );
+
+    Rectangle::new(min, Size::new(max.x - min.x, max.y - min.y))
+}
+
+/// The base of the head of an arrow from `from` to `to`, where its shaft
+/// ends, and the head's corners, tip first. `from` and `to` must differ.
+fn arrow_head(from: Point, to: Point) -> (Point, [Point; 3]) {
+    let length = from.distance(to);
+    let head_length = ARROW_HEAD_LENGTH.min(length);
+    let direction = (to - from) * (1.0 / length);
+    let base = to - direction * head_length;
+    let side = Vector::new(-direction.y, direction.x)
+        * (ARROW_HEAD_WIDTH / 2.0 * head_length / ARROW_HEAD_LENGTH);
+
+    (base, [to, base + side, base - side])
+}
+
+/// The shape `tool` draws when dragged from `start` to `end`, unless it would
+/// be empty: a line or an arrow between them, a rectangle or an ellipse
+/// spanning them, or a polygon or a star centered at `start` with a corner
+/// at `end`.
+fn shape(tool: Tool, start: Point, end: Point, corners: usize, color: Color) -> Option<Shape> {
+    let span = enclosing([start, end]);
+    let is_empty = match tool {
+        Tool::Rectangle | Tool::Ellipse => span.width == 0.0 || span.height == 0.0,
+        _ => start == end,
+    };
+
+    if is_empty {
+        return None;
+    }
+
+    let polygon = |dent| Shape::Polyline {
+        points: polygon(start, end, corners, dent),
+        closed: true,
+        color,
+    };
+
+    Some(match tool {
+        Tool::Line => Shape::Polyline {
+            points: vec![start, end],
+            closed: false,
+            color,
+        },
+        Tool::Arrow => Shape::Arrow {
+            from: start,
+            to: end,
+            color,
+        },
+        Tool::Rectangle => Shape::Polyline {
+            points: vec![
+                span.position(),
+                Point::new(span.x + span.width, span.y),
+                Point::new(span.x + span.width, span.y + span.height),
+                Point::new(span.x, span.y + span.height),
+            ],
+            closed: true,
+            color,
+        },
+        Tool::Ellipse => Shape::Ellipse {
+            center: span.center(),
+            radii: Vector::new(span.width, span.height) * 0.5,
+            color,
+        },
+        Tool::Polygon => polygon(None),
+        Tool::Star => polygon(Some(STAR_DENT)),
+        _ => return None,
+    })
+}
+
+/// Corners of a regular polygon centered at `center`, with one at `corner`.
+/// With a `dent`, it is a star with as many points, and dents between them
+/// at `dent` times their distance from the center.
+fn polygon(center: Point, corner: Point, corners: usize, dent: Option<f32>) -> Vec<Point> {
+    let radius = corner - center;
+    let step = TAU / corners as f32;
+
+    (0..corners)
+        .flat_map(|index| {
+            let angle = step * index as f32;
+            let dent = dent.map(|dent| center + rotated(radius * dent, angle + step / 2.0));
+            iter::once(center + rotated(radius, angle)).chain(dent)
+        })
+        .collect()
+}
+
+/// Size of `content` as text of `size` draws it.
+fn text_size(content: &str, size: f32) -> Size {
+    <Renderer as advanced_text::Renderer>::Paragraph::with_text(advanced_text::Text {
+        content,
+        bounds: Size::INFINITE,
+        size: size.into(),
+        line_height: LineHeight::Relative(TEXT_LINE_HEIGHT),
+        font: Font::DEFAULT,
+        align_x: advanced_text::Alignment::Default,
+        align_y: Vertical::Top,
+        shaping: advanced_text::Shaping::default(),
+        wrapping: advanced_text::Wrapping::None,
+    })
+    .min_bounds()
+}
+
+/// The largest rectangle with the aspect ratio of `size` that fits in
+/// `area`, centered in it.
+fn fit(size: Size, area: Rectangle) -> Rectangle {
+    let fitted = size * (area.width / size.width).min(area.height / size.height);
+    Rectangle::new(
+        area.center() - Vector::new(fitted.width, fitted.height) * 0.5,
+        fitted,
+    )
+}
+
+/// Depth of a background picked while there is none, see
+/// [`Background::depth`].
+const DEFAULT_BACKGROUND_DEPTH: f32 = 1.0;
+
+/// Width of a background when picked, centered behind the board, in
+/// multiples of the board's width. Its height follows from the image's
+/// proportions.
+const BACKGROUND_BOARD_WIDTHS: f32 = 5.0;
+
+/// File extensions of the raster images a picture can be, which the
+/// renderer decodes.
+const RASTER_EXTENSIONS: &[&str] = &[
+    "png", "jpg", "jpeg", "webp", "gif", "bmp", "tif", "tiff", "tga", "qoi", "ico", "pnm", "pbm",
+    "pgm", "ppm", "pam", "hdr", "exr", "dds", "ff",
+];
+
+/// File extensions of the vector images a picture can be, see
+/// [`rasterize_svg`].
+const VECTOR_EXTENSIONS: &[&str] = &["svg", "svgz"];
+
+/// Longest side, in pixels, of a rasterized vector image. Only very wide or
+/// tall images reach it, which would take up gigabytes otherwise.
+const MAX_RASTER_SIDE: f32 = 8192.0;
+
+/// Pixels per unit to rasterize a vector background of `size` at, drawn
+/// `width` wide: the size it takes up on screen at the highest zoom with the
+/// background right behind the board (at depth 0), so it never shows blurry,
+/// however its depth is set.
+fn background_scale(width: f32, size: Size) -> f32 {
+    let closest = Camera {
+        zoom: MAX_ZOOM,
+        ..Camera::default()
+    }
+    .behind(0.0);
+
+    width / size.width * closest.zoom
+}
+
+/// Asks for an image file and loads it, see [`load_picture`].
+fn pick_picture(
+    title: &str,
+    scale: impl Fn(Size) -> f32 + Copy + Send + 'static,
+) -> Task<Result<Picture, image::Error>> {
+    let dialog = rfd::AsyncFileDialog::new()
+        .set_title(title)
+        .add_filter("Images", &[RASTER_EXTENSIONS, VECTOR_EXTENSIONS].concat())
+        .pick_file();
+
+    // Loading it up front tells its size, and whether it is an image at all.
+    let loaded: Task<Result<_, image::Error>> = Task::future(dialog).and_then(move |file| {
+        let path = file.path().to_owned();
+        Task::future(async move { load_picture(&path, scale) })
+    });
+
+    loaded.and_then(|(handle, file)| {
+        image::allocate(handle).map(move |image| {
+            image.map(|image| Picture {
+                image,
+                file: file.clone(),
+            })
+        })
+    })
+}
+
+/// Prepares the image at `path` for the renderer, which decodes raster
+/// images itself, and keeps its file for exporting. A vector image is
+/// rasterized at `scale(size)` pixels per unit of its `size`, see
+/// [`rasterize_svg`].
+fn load_picture(
+    path: &Path,
+    scale: impl FnOnce(Size) -> f32,
+) -> Result<(image::Handle, ImageFile), image::Error> {
+    let is_vector = path
+        .extension()
+        .and_then(OsStr::to_str)
+        .is_some_and(|extension| {
+            VECTOR_EXTENSIONS
+                .iter()
+                .any(|vector| extension.eq_ignore_ascii_case(vector))
+        });
+
+    if is_vector {
+        let tree = parse_svg(path)?;
+        let size = Size::new(tree.size().width(), tree.size().height());
+        Ok((rasterize_svg(&tree, scale(size))?, ImageFile::vector(&tree)))
+    } else {
+        let file =
+            ImageFile::raster(path).map_err(|error| image::Error::Inaccessible(Arc::new(error)))?;
+        Ok((image::Handle::from_path(path), file))
+    }
+}
+
+fn parse_svg(path: &Path) -> Result<usvg::Tree, image::Error> {
+    let data = fs::read(path).map_err(|error| image::Error::Inaccessible(Arc::new(error)))?;
+
+    let mut options = usvg::Options {
+        // Where images it links to are looked up.
+        resources_dir: path.parent().map(Path::to_path_buf),
+        ..usvg::Options::default()
+    };
+    options.fontdb_mut().load_system_fonts();
+    resolve_generic_families(options.fontdb_mut());
+
+    usvg::Tree::from_data(&data, &options).map_err(|error| image::Error::Invalid(Arc::new(error)))
+}
+
+/// Rasterizes `tree` once, at `scale` pixels per unit, which should be the
+/// size it takes up on screen at the highest zoom so it never shows blurry.
+/// The renderer could draw it as is, but it would rasterize it again
+/// whenever its size on screen changes, which is every frame of a zoom.
+fn rasterize_svg(tree: &usvg::Tree, scale: f32) -> Result<image::Handle, image::Error> {
+    let svg = Size::new(tree.size().width(), tree.size().height());
+    let scale = scale.min(MAX_RASTER_SIDE / svg.width.max(svg.height));
+
+    let mut pixmap = tiny_skia::Pixmap::new(
+        (svg.width * scale).ceil() as u32,
+        (svg.height * scale).ceil() as u32,
+    )
+    .ok_or(image::Error::Empty)?;
+    resvg::render(
+        tree,
+        tiny_skia::Transform::from_scale(scale, scale),
+        &mut pixmap.as_mut(),
+    );
+
+    let (width, height) = (pixmap.width(), pixmap.height());
+    let mut pixels = pixmap.take();
+
+    // tiny-skia multiplies the colors by their alpha, but the renderer takes
+    // them as they are.
+    for [red, green, blue, alpha] in pixels.as_chunks_mut::<4>().0 {
+        let alpha = u16::from(*alpha);
+
+        for channel in [red, green, blue] {
+            // Transparent pixels have no color to take back.
+            if let Some(straight) = (u16::from(*channel) * 255 + alpha / 2).checked_div(alpha) {
+                *channel = straight as u8;
+            }
+        }
+    }
+
+    Ok(image::Handle::from_rgba(width, height, pixels))
+}
+
+/// Points each generic font family (e.g. sans-serif), which SVG text falls
+/// back to, at an installed font. fontdb takes the font fontconfig prefers
+/// most for each, even if it isn't installed, so this asks fontconfig which
+/// one it would use instead.
+fn resolve_generic_families(fontdb: &mut usvg::fontdb::Database) {
+    use usvg::fontdb::{Database, Family, Query};
+
+    type Setter = fn(&mut Database, String);
+
+    let generics: [(Family, &str, Setter); 5] = [
+        (Family::Serif, "serif", Database::set_serif_family),
+        (
+            Family::SansSerif,
+            "sans-serif",
+            Database::set_sans_serif_family,
+        ),
+        (
+            Family::Monospace,
+            "monospace",
+            Database::set_monospace_family,
+        ),
+        (Family::Cursive, "cursive", Database::set_cursive_family),
+        (Family::Fantasy, "fantasy", Database::set_fantasy_family),
+    ];
+
+    for (family, pattern, set) in generics {
+        let query = Query {
+            families: &[family],
+            ..Query::default()
+        };
+
+        if fontdb.query(&query).is_some() {
+            continue;
+        }
+
+        // Without fontconfig (e.g. on Windows), the family stays as it is.
+        if let Ok(output) = Command::new("fc-match")
+            .args(["--format=%{family[0]}", pattern])
+            .output()
+            && let Ok(name) = String::from_utf8(output.stdout)
+            && !name.is_empty()
+        {
+            set(fontdb, name);
+        }
+    }
+}
+
+/// A loaded image: the background, or one on the board.
+#[derive(Debug, Clone, PartialEq)]
+struct Picture {
+    /// Keeps the image loaded, so it shows as soon as it is set, or brought
+    /// back by undoing.
+    image: image::Allocation,
+    file: ImageFile,
+}
+
+impl Picture {
+    /// Size in pixels.
+    fn size(&self) -> Size {
+        let size = self.image.size();
+        Size::new(size.width as f32, size.height as f32)
+    }
+}
+
+/// The image behind the board, and the size and depth it is drawn at.
+#[derive(Debug, Clone, PartialEq)]
+struct Background {
+    picture: Picture,
+    width: String,
+    height: String,
+    /// In whole units of the background's plane, keeping the picture's
+    /// proportions, as stretching an image rarely looks right. The inputs may
+    /// not form a valid size (e.g. mid-edit), in which case this keeps the
+    /// last valid one.
+    size: Size,
+    depth_input: String,
+    /// Distance behind the board, in multiples of the camera's distance to
+    /// the board at zoom 1. The further it is, the slower it moves, and at 0
+    /// it moves with the board. The input may not be a valid depth (e.g.
+    /// mid-edit), in which case this keeps the last valid one.
+    depth: f32,
+}
+
+impl Background {
+    /// `picture` `width` wide, keeping its proportions, `depth` behind the
+    /// board.
+    fn new(picture: Picture, width: f32, depth: f32) -> Self {
+        let image = picture.size();
+        let size = Size::new(
+            round_side(width),
+            round_side(width * image.height / image.width),
+        );
+
+        Self {
+            picture,
+            width: size.width.to_string(),
+            height: size.height.to_string(),
+            size,
+            depth_input: depth.to_string(),
+            depth,
+        }
+    }
+
+    /// With the depth input set to `input`.
+    fn with_depth(&self, input: String) -> Self {
+        Self {
+            depth: parse_depth(&input).unwrap_or(self.depth),
+            depth_input: input,
+            ..self.clone()
+        }
+    }
+
+    /// With the width input set to `input`, which the height follows.
+    fn with_width(&self, input: String) -> Self {
+        let mut next = Self {
+            width: input,
+            ..self.clone()
+        };
+
+        if let Some(width) = parse_side(&next.width) {
+            let image = self.picture.size();
+            next.size = Size::new(width, round_side(width * image.height / image.width));
+            next.height = next.size.height.to_string();
+        }
+
+        next
+    }
+
+    /// With the height input set to `input`, which the width follows.
+    fn with_height(&self, input: String) -> Self {
+        let mut next = Self {
+            height: input,
+            ..self.clone()
+        };
+
+        if let Some(height) = parse_side(&next.height) {
+            let image = self.picture.size();
+            next.size = Size::new(round_side(height * image.width / image.height), height);
+            next.width = next.size.width.to_string();
+        }
+
+        next
+    }
+}
+
+/// Draws the background through the camera of the board drawn over it.
+struct BackgroundView<'a> {
+    background: &'a Background,
+    camera: Camera,
+}
+
+impl canvas::Program<Message> for BackgroundView<'_> {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &Self::State,
+        renderer: &Renderer,
+        _theme: &Theme,
+        bounds: Rectangle,
+        _cursor: mouse::Cursor,
+    ) -> Vec<Geometry> {
+        let mut frame = canvas::Frame::new(renderer, bounds.size());
+        self.camera.behind(self.background.depth).apply(&mut frame);
+
+        let size = self.background.size;
+        let top_left = Point::ORIGIN - Vector::new(size.width, size.height) * 0.5;
+
+        frame.draw_image(
+            Rectangle::new(top_left, size),
+            canvas::Image::new(self.background.picture.image.handle().clone()),
+        );
+
+        vec![frame.into_geometry()]
+    }
+}
+
+/// Draws the board through the camera, under the items.
+struct BoardView {
+    board: Board,
+    camera: Camera,
+    /// Whether the background shows through the board, which is then
+    /// outlined rather than filled white.
+    see_through: bool,
+}
+
+impl canvas::Program<Message> for BoardView {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &Self::State,
+        renderer: &Renderer,
+        _theme: &Theme,
+        bounds: Rectangle,
+        _cursor: mouse::Cursor,
+    ) -> Vec<Geometry> {
+        let mut frame = canvas::Frame::new(renderer, bounds.size());
+        // Draw in board coordinates from here on.
+        self.camera.apply(&mut frame);
+
+        let size = self.board.size;
+        let top_left = Point::ORIGIN - Vector::new(size.width, size.height) * 0.5;
+        // Not `fill_rectangle`, which the wgpu renderer keeps axis-aligned,
+        // squashing the board when the camera is turned.
+        let board = canvas::Path::rectangle(top_left, size);
+
+        if self.see_through {
+            for (color, width) in BOARD_OUTLINE {
+                // As thick at any zoom.
+                let width = width / self.camera.zoom;
+                frame.stroke(
+                    &board,
+                    canvas::Stroke::default()
+                        .with_color(color)
+                        .with_width(width),
+                );
+            }
+        } else {
+            frame.fill(&board, BOARD_COLOR);
+        }
+
+        vec![frame.into_geometry()]
+    }
+}
+
+/// Draws a run of items through the camera, see [`Item::shares_canvas`].
+struct ItemsView<'a> {
+    camera: Camera,
+    items: &'a [Item],
+}
+
+impl canvas::Program<Message> for ItemsView<'_> {
+    type State = ();
+
+    fn draw(
+        &self,
+        _state: &Self::State,
+        renderer: &Renderer,
+        _theme: &Theme,
+        bounds: Rectangle,
+        _cursor: mouse::Cursor,
+    ) -> Vec<Geometry> {
+        let mut frame = canvas::Frame::new(renderer, bounds.size());
+        self.camera.apply(&mut frame);
+
+        for item in self.items {
+            item.draw(&mut frame);
+        }
+
+        vec![frame.into_geometry()]
+    }
+}
+
+/// Distance in screen pixels from an item within which the cursor is on it.
+const HIT_DISTANCE: f32 = 6.0;
+
+/// Distance in screen pixels between the points of a pencil stroke.
+const PENCIL_STEP: f32 = 2.0;
+
+/// Distance in screen pixels from the start of a path within which a click
+/// closes it.
+const CLOSE_DISTANCE: f32 = 8.0;
+
+/// Shortest side, in screen pixels, of an area dragged out for an image. A
+/// smaller drag counts as a click, which places the image in an area
+/// [`IMAGE_AREA`] times the size of the board around it.
+const MIN_IMAGE_DRAG: f32 = 8.0;
+const IMAGE_AREA: f32 = 0.5;
+
+/// Gap and width, in screen pixels, of the outline around the selected item.
+const SELECTION_GAP: f32 = 4.0;
+const SELECTION_WIDTH: f32 = 2.0;
+
+/// Size in screen pixels of the handles on the outline of the selected item,
+/// and how far from their centers they can be grabbed.
+const HANDLE_SIZE: f32 = 8.0;
+const HANDLE_REACH: f32 = 8.0;
+
+/// Distance in screen pixels of the handle that turns the selected item
+/// above its outline.
+const TURN_HANDLE_DISTANCE: f32 = 24.0;
+
+/// Angle in radians that items turn by at a time with Shift held.
+const TURN_STEP: f32 = PI / 12.0;
+
+/// Speed of the cursor in screen pixels per second below which it counts as
+/// moving slowly, so turning the camera or an item stops at right angles
+/// (see [`Turn`]).
+const SLOW_TURN_SPEED: f32 = 300.0;
+
+/// How far back the speed of the cursor is measured over.
+const SPEED_WINDOW: Duration = Duration::from_millis(100);
+
+/// Angle in radians (10°) that a turn stopped at a right angle must be
+/// dragged past it to go on.
+const RIGHT_ANGLE_HOLD: f32 = PI / 18.0;
+
+/// Size in screen pixels an item can't be resized below, unless it already
+/// is, so it doesn't vanish or turn inside out.
+const MIN_RESIZE: f32 = 4.0;
+
+/// Directions from an item's center of the sides and corners of its outline
+/// it can be resized from, along its own axes.
+const RESIZE_SIDES: [Vector; 8] = [
+    Vector::new(-1.0, -1.0),
+    Vector::new(0.0, -1.0),
+    Vector::new(1.0, -1.0),
+    Vector::new(1.0, 0.0),
+    Vector::new(1.0, 1.0),
+    Vector::new(0.0, 1.0),
+    Vector::new(-1.0, 1.0),
+    Vector::new(-1.0, 0.0),
+];
+
+/// Width in screen pixels of the caret of the text being written.
+const CARET_WIDTH: f32 = 2.0;
+
+/// Pointer state kept by the tool canvas between events.
 #[derive(Debug, Default)]
 struct Interaction {
     modifiers: keyboard::Modifiers,
-    /// Last cursor position while the camera is being dragged.
-    drag: Option<Point>,
-    /// Item being drawn, previewed until the button is released.
-    draft: Option<Item>,
+    trail: Trail,
+    grab: Option<Grab>,
+    /// Item being drawn, previewed until it is finished.
+    draft: Option<Draft>,
+    /// The last click, to tell double clicks.
+    click: Option<Click>,
 }
 
-/// Draws the board and its items through the selected frame's camera, and
-/// turns pointer input into camera moves and new items.
-struct BoardView<'a> {
+/// Recent cursor positions on screen, oldest first, to tell how fast it
+/// moves.
+#[derive(Debug, Default)]
+struct Trail(VecDeque<(Instant, Point)>);
+
+impl Trail {
+    /// Adds the cursor at `position`, returning its speed in screen pixels
+    /// per second over the last [`SPEED_WINDOW`].
+    fn extend(&mut self, position: Point, now: Instant) -> f32 {
+        // The speed is measured from the newest position at least the
+        // window old, so after a pause it is slow.
+        while self
+            .0
+            .get(1)
+            .is_some_and(|&(time, _)| now.saturating_duration_since(time) >= SPEED_WINDOW)
+        {
+            self.0.pop_front();
+        }
+
+        let speed = self.0.front().map_or(0.0, |&(time, from)| {
+            let elapsed = now.saturating_duration_since(time).as_secs_f32();
+            if elapsed > 0.0 {
+                from.distance(position) / elapsed
+            } else {
+                0.0
+            }
+        });
+
+        self.0.push_back((now, position));
+        speed
+    }
+}
+
+/// What is being dragged.
+#[derive(Debug, Clone)]
+enum Grab {
+    /// The camera, with the last cursor position, and its rotation while
+    /// turned (see [`Mode::Rotate`]).
+    Camera { last: Point, turn: Turn },
+    /// The selected item, as it was when grabbed at the board point `start`,
+    /// and its rotation while `edit` turns it.
+    Item {
+        item: Item,
+        start: Point,
+        edit: Edit,
+        turn: Turn,
+    },
+}
+
+/// A rotation being dragged. Reaching a right angle while the cursor moves
+/// slowly, it stops there until dragged [`RIGHT_ANGLE_HOLD`] past it either
+/// way, so it is easy to set straight. Moving fast, it goes right through.
+#[derive(Debug, Clone, Copy)]
+struct Turn {
+    /// Rotation the cursor drags to, not stopping. It isn't wrapped to a
+    /// full turn, so it changes smoothly.
+    free: f32,
+    /// The right angle the rotation is stopped at.
+    stop: Option<f32>,
+}
+
+impl Turn {
+    fn new(rotation: f32) -> Self {
+        Self {
+            free: rotation,
+            stop: None,
+        }
+    }
+
+    /// Drags the rotation to `rotation` (or any whole turns away from it),
+    /// returning the rotation to show. Only while the cursor moves `slow`
+    /// does it stop at the right angles it reaches.
+    fn to(&mut self, rotation: f32, slow: bool) -> f32 {
+        let from = self.free;
+        let to = from + wrapped(rotation - from);
+        self.free = to;
+
+        if let Some(stop) = self.stop {
+            if (to - stop).abs() <= RIGHT_ANGLE_HOLD {
+                return stop;
+            }
+            self.stop = None;
+        }
+
+        // Reached when dragged onto or across it. Starting from it (give or
+        // take rounding) isn't reaching it, so a drag from a right angle
+        // turns right away.
+        let right = (to / FRAC_PI_2).round() * FRAC_PI_2;
+        let reached = (from - right).abs() > 1e-4 && (from - right) * (to - right) <= 0.0;
+
+        if slow && reached && (to - right).abs() <= RIGHT_ANGLE_HOLD {
+            self.stop = Some(right);
+            right
+        } else {
+            to
+        }
+    }
+}
+
+/// What dragging the selected item does to it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Edit {
+    Move,
+    /// Turns it around the center of its outline.
+    Turn,
+    /// Resizes it from the side or corner of its outline in this direction
+    /// (see [`RESIZE_SIDES`]), while the opposite one stays in place.
+    Resize(Vector),
+}
+
+/// An item being drawn.
+#[derive(Debug, Clone)]
+enum Draft {
+    /// Dragged from `start` to `end` with `tool`, see [`shape`]. For
+    /// [`Tool::Image`], the area to place the image in.
+    Drag {
+        tool: Tool,
+        start: Point,
+        end: Point,
+    },
+    /// The points of a pencil stroke, while the button is held.
+    Stroke(Vec<Point>),
+    /// The points of a path clicked so far, and the cursor, where the next
+    /// segment would end.
+    Path { points: Vec<Point>, cursor: Point },
+    /// Text typed so far.
+    Text { position: Point, content: String },
+}
+
+/// Turns pointer and key input into camera moves and edits of the items, by
+/// tool, and draws what is being drawn and the selection over the items.
+struct ToolView<'a> {
     board: Board,
     camera: Camera,
     items: &'a [Item],
+    selected: Option<usize>,
     mode: Mode,
     tool: Tool,
+    /// Color new items are drawn in.
+    color: Color,
+    /// Corners of new polygons, and points of new stars.
+    corners: usize,
 }
 
-impl canvas::Program<Message> for BoardView<'_> {
+impl ToolView<'_> {
+    /// Converts a cursor position to board coordinates.
+    fn to_board(&self, position: Point, bounds: Rectangle) -> Point {
+        self.camera.to_board(position - bounds.center())
+    }
+
+    /// Index of the topmost item at `point`.
+    fn item_at(&self, point: Point) -> Option<usize> {
+        let distance = HIT_DISTANCE / self.camera.zoom;
+        self.items
+            .iter()
+            .rposition(|item| item.hits(point, distance))
+    }
+
+    /// The item `draft` makes so far, unless it would be empty.
+    fn item(&self, draft: &Draft) -> Option<Item> {
+        let color = self.color;
+
+        let shape = match draft {
+            Draft::Drag { tool, start, end } => shape(*tool, *start, *end, self.corners, color),
+            Draft::Stroke(points) | Draft::Path { points, .. } => {
+                (points.len() > 1).then(|| Shape::Polyline {
+                    points: points.clone(),
+                    closed: false,
+                    color,
+                })
+            }
+            Draft::Text { position, content } => {
+                (!content.trim().is_empty()).then(|| Shape::Text {
+                    position: *position,
+                    content: content.clone(),
+                    size: TEXT_SIZE,
+                    color,
+                })
+            }
+        };
+
+        shape.map(Item::new)
+    }
+
+    /// The message that finishes `draft`, if anything comes of it.
+    fn finish(&self, draft: &Draft) -> Option<Message> {
+        match *draft {
+            Draft::Drag {
+                tool: Tool::Image,
+                start,
+                end,
+            } => Some(Message::PlaceImage(self.image_area(start, end))),
+            ref draft => self.item(draft).map(Message::ItemDrawn),
+        }
+    }
+
+    /// The outline drawn around `item` when it is selected, in its own
+    /// coordinates: its extent, with a gap past the thickness of its lines.
+    fn outline(&self, item: &Item) -> Rectangle {
+        item.shape
+            .extent()
+            .expand(LINE_WIDTH / 2.0 + SELECTION_GAP / self.camera.zoom)
+    }
+
+    /// The handles on the outline of `item`, by what dragging them does, and
+    /// where they are in its own coordinates.
+    fn handles(&self, item: &Item) -> impl Iterator<Item = (Edit, Point)> {
+        let outline = self.outline(item);
+        let center = outline.center();
+        let keeps_proportions = item.shape.keeps_proportions();
+        // Too narrow for handles on both sides and the corners between them
+        // to fit.
+        let is_flat = |size: f32| size * self.camera.zoom < 2.0 * HANDLE_SIZE;
+        let (is_thin, is_flat) = (is_flat(outline.width), is_flat(outline.height));
+
+        let resize = RESIZE_SIDES
+            .into_iter()
+            // Shapes that keep their proportions resize from their corners,
+            // and flat ones (e.g. a level line) along themselves.
+            .filter(move |side| {
+                let is_corner = side.x != 0.0 && side.y != 0.0;
+
+                match (is_thin, is_flat) {
+                    _ if keeps_proportions => is_corner,
+                    (true, true) => is_corner,
+                    (false, true) => side.y == 0.0,
+                    (true, false) => side.x == 0.0,
+                    (false, false) => true,
+                }
+            })
+            .map(move |side| {
+                let offset = Vector::new(side.x * outline.width, side.y * outline.height) * 0.5;
+                (Edit::Resize(side), center + offset)
+            });
+
+        let turn = Point::new(
+            center.x,
+            outline.y - TURN_HANDLE_DISTANCE / self.camera.zoom,
+        );
+
+        resize.chain([(Edit::Turn, turn)])
+    }
+
+    /// What dragging from the board point `point` with the select tool
+    /// edits: a handle of the selected item, else the topmost item there,
+    /// else the selected item, if `point` is in its outline.
+    fn grabbed_at(&self, point: Point) -> Option<(usize, Edit)> {
+        let selected = self
+            .selected
+            .and_then(|index| Some((index, self.items.get(index)?)));
+
+        let handle = selected.and_then(|(index, item)| {
+            let local = item.to_local(point);
+            let (edit, _) = self
+                .handles(item)
+                .find(|(_, at)| at.distance(local) * self.camera.zoom <= HANDLE_REACH)?;
+            Some((index, edit))
+        });
+
+        handle
+            .or_else(|| Some((self.item_at(point)?, Edit::Move)))
+            .or_else(|| {
+                let (index, item) = selected?;
+                self.outline(item)
+                    .contains(item.to_local(point))
+                    .then_some((index, Edit::Move))
+            })
+    }
+
+    /// `item` edited by dragging it from the board point `start` to `point`.
+    fn edited(&self, item: &Item, edit: Edit, start: Point, point: Point, shift: bool) -> Item {
+        match edit {
+            Edit::Move => item.translated(point - start),
+            Edit::Turn => {
+                let center = item.center();
+                let mut angle = angle_between(start - center, point - center);
+
+                // Shift turns it in steps.
+                if shift {
+                    let rotation = ((item.rotation + angle) / TURN_STEP).round() * TURN_STEP;
+                    angle = rotation - item.rotation;
+                }
+
+                item.turned(center, angle)
+            }
+            Edit::Resize(side) => {
+                let extent = item.shape.extent();
+                let half = Vector::new(side.x * extent.width, side.y * extent.height) * 0.5;
+                // The side or corner dragged, and the opposite one.
+                let dragged = extent.center() + half;
+                let anchor = extent.center() - half;
+                let delta = rotated(point - start, -item.rotation);
+
+                // The least a size can be stretched by.
+                let min = MIN_RESIZE / self.camera.zoom;
+                let least = |size: f32| {
+                    if size > 0.0 {
+                        min.min(size) / size
+                    } else {
+                        0.0
+                    }
+                };
+                let factor = |side: f32, size: f32, delta: f32| {
+                    if side == 0.0 || size == 0.0 {
+                        1.0
+                    } else {
+                        ((size + delta * side) / size).max(least(size))
+                    }
+                };
+
+                let mut factors = Vector::new(
+                    factor(side.x, extent.width, delta.x),
+                    factor(side.y, extent.height, delta.y),
+                );
+
+                // Shift keeps the proportions.
+                if shift || item.shape.keeps_proportions() {
+                    let factor = if side.x != 0.0 && side.y != 0.0 {
+                        // How far along the diagonal through the corner it
+                        // is dragged.
+                        let dot = |a: Vector, b: Vector| a.x * b.x + a.y * b.y;
+                        let diagonal = dragged - anchor;
+                        dot(diagonal + delta, diagonal) / dot(diagonal, diagonal)
+                    } else if side.x != 0.0 {
+                        factors.x
+                    } else {
+                        factors.y
+                    };
+                    let factor = factor.max(least(extent.width)).max(least(extent.height));
+                    factors = Vector::new(factor, factor);
+                }
+
+                Item {
+                    shape: item.shape.scaled(anchor, factors),
+                    rotation: item.rotation,
+                }
+            }
+        }
+    }
+
+    /// The cursor for dragging `item` with `edit`.
+    fn edit_cursor(&self, item: &Item, edit: Edit, is_dragging: bool) -> mouse::Interaction {
+        match edit {
+            Edit::Move => mouse::Interaction::Move,
+            Edit::Turn if is_dragging => mouse::Interaction::Grabbing,
+            Edit::Turn => mouse::Interaction::Grab,
+            Edit::Resize(side) => {
+                // Along the way the side moves on screen, either way.
+                let side = rotated(side, item.rotation + self.camera.rotation);
+                let angle = side.y.atan2(side.x).rem_euclid(PI);
+
+                match (angle / (PI / 4.0)).round() as u8 % 4 {
+                    0 => mouse::Interaction::ResizingHorizontally,
+                    1 => mouse::Interaction::ResizingDiagonallyDown,
+                    2 => mouse::Interaction::ResizingVertically,
+                    _ => mouse::Interaction::ResizingDiagonallyUp,
+                }
+            }
+        }
+    }
+
+    /// Area to place an image in, dragged out from `start` to `end`.
+    fn image_area(&self, start: Point, end: Point) -> Rectangle {
+        let area = enclosing([start, end]);
+
+        if area.width.min(area.height) * self.camera.zoom >= MIN_IMAGE_DRAG {
+            area
+        } else {
+            let size = self.board.size * IMAGE_AREA;
+            Rectangle::new(start - Vector::new(size.width, size.height) * 0.5, size)
+        }
+    }
+
+    fn press(
+        &self,
+        state: &mut Interaction,
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+    ) -> Option<canvas::Action<Message>> {
+        let Some(position) = cursor.position_over(bounds) else {
+            // Clicking elsewhere (e.g. on another tool) finishes the path or
+            // text being drawn, and goes on to what was clicked.
+            let draft = state.draft.take()?;
+            return Some(publish_or_redraw(self.finish(&draft)));
+        };
+
+        let point = self.to_board(position, bounds);
+        let click = Click::new(position, mouse::Button::Left, state.click);
+        state.click = Some(click);
+
+        let action = match self.tool {
+            Tool::Select => {
+                let grabbed = self.grabbed_at(point);
+                state.grab = Some(match grabbed {
+                    Some((index, edit)) => Grab::Item {
+                        item: self.items[index].clone(),
+                        start: point,
+                        edit,
+                        turn: Turn::new(self.items[index].rotation),
+                    },
+                    None => Grab::Camera {
+                        last: position,
+                        turn: Turn::new(self.camera.rotation),
+                    },
+                });
+                canvas::Action::publish(Message::ItemSelected(grabbed.map(|(index, _)| index)))
+            }
+            Tool::Pan => {
+                state.grab = Some(Grab::Camera {
+                    last: position,
+                    turn: Turn::new(self.camera.rotation),
+                });
+                canvas::Action::publish(Message::CameraGrabbed)
+            }
+            Tool::Pencil => {
+                state.draft = Some(Draft::Stroke(vec![point]));
+                canvas::Action::request_redraw()
+            }
+            Tool::Path => {
+                let Some(Draft::Path { points, .. }) = &mut state.draft else {
+                    state.draft = Some(Draft::Path {
+                        points: vec![point],
+                        cursor: point,
+                    });
+                    return Some(canvas::Action::request_redraw().and_capture());
+                };
+
+                // Clicking the start closes the path, and a double click
+                // ends it where the first of the two clicks put its last
+                // point.
+                if points.len() >= MIN_CORNERS
+                    && points[0].distance(point) * self.camera.zoom <= CLOSE_DISTANCE
+                {
+                    let points = std::mem::take(points);
+                    state.draft = None;
+                    canvas::Action::publish(Message::ItemDrawn(Item::new(Shape::Polyline {
+                        points,
+                        closed: true,
+                        color: self.color,
+                    })))
+                } else if click.kind() == click::Kind::Double {
+                    let draft = state.draft.take()?;
+                    publish_or_redraw(self.finish(&draft))
+                } else {
+                    points.push(point);
+                    canvas::Action::request_redraw()
+                }
+            }
+            Tool::Text => {
+                // Clicking again finishes the text being written, and starts
+                // another where clicked.
+                let finished = state.draft.take().and_then(|draft| self.finish(&draft));
+                state.draft = Some(Draft::Text {
+                    position: point,
+                    content: String::new(),
+                });
+                publish_or_redraw(finished)
+            }
+            Tool::Line
+            | Tool::Arrow
+            | Tool::Rectangle
+            | Tool::Ellipse
+            | Tool::Polygon
+            | Tool::Star
+            | Tool::Image => {
+                state.draft = Some(Draft::Drag {
+                    tool: self.tool,
+                    start: point,
+                    end: point,
+                });
+                canvas::Action::request_redraw()
+            }
+        };
+
+        Some(action.and_capture())
+    }
+
+    fn cursor_moved(
+        &self,
+        state: &mut Interaction,
+        bounds: Rectangle,
+        position: Point,
+    ) -> Option<canvas::Action<Message>> {
+        let point = self.to_board(position, bounds);
+        let slow = state.trail.extend(position, Instant::now()) < SLOW_TURN_SPEED;
+
+        if let Some(grab) = &mut state.grab {
+            let message = match grab {
+                Grab::Camera { last, turn } => {
+                    let message = match self.mode {
+                        Mode::Move => Message::CameraMoved(position - *last),
+                        // Turns the board like a knob, keeping the cursor on
+                        // the same angle around the center, but for stops at
+                        // right angles.
+                        Mode::Rotate => {
+                            let angle =
+                                angle_between(*last - bounds.center(), position - bounds.center());
+                            Message::CameraRotated(turn.to(turn.free + angle, slow))
+                        }
+                    };
+                    *last = position;
+                    message
+                }
+                // From the item as it was when grabbed, so the edit doesn't
+                // drift as it goes.
+                Grab::Item {
+                    item,
+                    start,
+                    edit,
+                    turn,
+                } => {
+                    let shift = state.modifiers.shift();
+                    let mut edited = self.edited(item, *edit, *start, point, shift);
+
+                    // Turning in steps with Shift doesn't stop at right
+                    // angles too.
+                    if *edit == Edit::Turn {
+                        let rotation = turn.to(edited.rotation, slow && !shift);
+                        edited =
+                            edited.turned(edited.center(), wrapped(rotation - edited.rotation));
+                    }
+
+                    Message::ItemEdited(edited)
+                }
+            };
+
+            return Some(canvas::Action::publish(message));
+        }
+
+        match state.draft.as_mut()? {
+            Draft::Drag { end, .. } => *end = point,
+            Draft::Stroke(points) => {
+                // Leaving out points too close together keeps long strokes
+                // light.
+                if points
+                    .last()
+                    .is_some_and(|last| last.distance(point) * self.camera.zoom < PENCIL_STEP)
+                {
+                    return None;
+                }
+                points.push(point);
+            }
+            Draft::Path { cursor, .. } => *cursor = point,
+            Draft::Text { .. } => return None,
+        }
+
+        Some(canvas::Action::request_redraw())
+    }
+
+    fn release(&self, state: &mut Interaction) -> Option<canvas::Action<Message>> {
+        if state.grab.take().is_some() {
+            return Some(canvas::Action::publish(Message::Released));
+        }
+
+        // Paths and text go on after the button is released.
+        if !matches!(state.draft, Some(Draft::Drag { .. } | Draft::Stroke(_))) {
+            return None;
+        }
+
+        let draft = state.draft.take()?;
+        Some(publish_or_redraw(self.finish(&draft)))
+    }
+
+    fn key_press(
+        &self,
+        state: &mut Interaction,
+        key: &keyboard::Key,
+        text: Option<&str>,
+        modifiers: keyboard::Modifiers,
+    ) -> Option<canvas::Action<Message>> {
+        // Shortcuts go on to the app.
+        if modifiers.command() {
+            return None;
+        }
+
+        let key = key.as_ref();
+
+        let action = match state.draft.as_mut()? {
+            Draft::Text { content, .. } => match key {
+                keyboard::Key::Named(Named::Escape) => {
+                    let draft = state.draft.take()?;
+                    publish_or_redraw(self.finish(&draft))
+                }
+                keyboard::Key::Named(Named::Enter) => {
+                    content.push('\n');
+                    canvas::Action::request_redraw()
+                }
+                keyboard::Key::Named(Named::Backspace) => {
+                    content.pop();
+                    canvas::Action::request_redraw()
+                }
+                _ => {
+                    let typed: String = text?.chars().filter(|c| !c.is_control()).collect();
+
+                    if typed.is_empty() {
+                        return None;
+                    }
+
+                    content.push_str(&typed);
+                    canvas::Action::request_redraw()
+                }
+            },
+            Draft::Path { points, .. } => match key {
+                keyboard::Key::Named(Named::Enter) => {
+                    let draft = state.draft.take()?;
+                    publish_or_redraw(self.finish(&draft))
+                }
+                keyboard::Key::Named(Named::Escape) => {
+                    state.draft = None;
+                    canvas::Action::request_redraw()
+                }
+                keyboard::Key::Named(Named::Backspace) => {
+                    points.pop();
+                    if points.is_empty() {
+                        state.draft = None;
+                    }
+                    canvas::Action::request_redraw()
+                }
+                _ => return None,
+            },
+            Draft::Drag { .. } | Draft::Stroke(_) => return None,
+        };
+
+        Some(action.and_capture())
+    }
+}
+
+/// Publishes `message`, or else redraws, e.g. to clear a draft that came to
+/// nothing.
+fn publish_or_redraw(message: Option<Message>) -> canvas::Action<Message> {
+    message.map_or_else(canvas::Action::request_redraw, canvas::Action::publish)
+}
+
+impl canvas::Program<Message> for ToolView<'_> {
     type State = Interaction;
 
     fn update(
@@ -1098,6 +3736,12 @@ impl canvas::Program<Message> for BoardView<'_> {
                 state.modifiers = *modifiers;
                 None
             }
+            Event::Keyboard(keyboard::Event::KeyPressed {
+                key,
+                modifiers,
+                text,
+                ..
+            }) => self.key_press(state, key, text.as_deref(), *modifiers),
             Event::Mouse(mouse::Event::WheelScrolled { delta }) if state.modifiers.control() => {
                 let position = cursor.position_over(bounds)?;
                 let lines = match *delta {
@@ -1113,52 +3757,13 @@ impl canvas::Program<Message> for BoardView<'_> {
                     .and_capture(),
                 )
             }
-            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
-                if self.tool == Tool::Line =>
-            {
-                let start = self
-                    .camera
-                    .to_board(cursor.position_over(bounds)? - bounds.center());
-                state.draft = Some(Item::Line {
-                    from: start,
-                    to: start,
-                });
-                Some(canvas::Action::capture())
-            }
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
-                state.drag = Some(cursor.position_over(bounds)?);
-                Some(canvas::Action::publish(Message::CameraGrabbed).and_capture())
+                self.press(state, bounds, cursor)
             }
             Event::Mouse(mouse::Event::CursorMoved { position }) => {
-                if let Some(Item::Line { to, .. }) = &mut state.draft {
-                    *to = self.camera.to_board(*position - bounds.center());
-                    Some(canvas::Action::request_redraw())
-                } else {
-                    let last = state.drag.as_mut()?;
-                    let message = match self.mode {
-                        Mode::Move => Message::CameraMoved(*position - *last),
-                        // Turns the board like a knob, keeping the cursor
-                        // on the same angle around the center.
-                        Mode::Rotate => Message::CameraRotated(angle_between(
-                            *last - bounds.center(),
-                            *position - bounds.center(),
-                        )),
-                    };
-                    *last = *position;
-                    Some(canvas::Action::publish(message))
-                }
+                self.cursor_moved(state, bounds, *position)
             }
-            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
-                if state.drag.take().is_some() {
-                    return Some(canvas::Action::publish(Message::CameraReleased));
-                }
-
-                match state.draft.take()? {
-                    // A click without dragging draws nothing.
-                    Item::Line { from, to } if from == to => Some(canvas::Action::request_redraw()),
-                    item => Some(canvas::Action::publish(Message::ItemDrawn(item))),
-                }
-            }
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => self.release(state),
             _ => None,
         }
     }
@@ -1169,14 +3774,30 @@ impl canvas::Program<Message> for BoardView<'_> {
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> mouse::Interaction {
-        if state.drag.is_some() {
-            mouse::Interaction::Grabbing
-        } else if state.draft.is_some() || self.tool == Tool::Line && cursor.is_over(bounds) {
-            mouse::Interaction::Crosshair
-        } else if cursor.is_over(bounds) {
-            mouse::Interaction::Grab
-        } else {
-            mouse::Interaction::default()
+        match (&state.grab, &state.draft) {
+            (Some(Grab::Camera { .. }), _) => return mouse::Interaction::Grabbing,
+            (Some(Grab::Item { item, edit, .. }), _) => {
+                return self.edit_cursor(item, *edit, true);
+            }
+            // Until the button is released, wherever the cursor is.
+            (None, Some(Draft::Drag { .. } | Draft::Stroke(_))) => {
+                return mouse::Interaction::Crosshair;
+            }
+            _ => {}
+        }
+
+        let Some(position) = cursor.position_over(bounds) else {
+            return mouse::Interaction::default();
+        };
+
+        match self.tool {
+            Tool::Select => match self.grabbed_at(self.to_board(position, bounds)) {
+                Some((index, edit)) => self.edit_cursor(&self.items[index], edit, false),
+                None => mouse::Interaction::Grab,
+            },
+            Tool::Pan => mouse::Interaction::Grab,
+            Tool::Text => mouse::Interaction::Text,
+            _ => mouse::Interaction::Crosshair,
         }
     }
 
@@ -1184,24 +3805,103 @@ impl canvas::Program<Message> for BoardView<'_> {
         &self,
         state: &Self::State,
         renderer: &Renderer,
-        _theme: &Theme,
+        theme: &Theme,
         bounds: Rectangle,
         _cursor: mouse::Cursor,
     ) -> Vec<Geometry> {
         let mut frame = canvas::Frame::new(renderer, bounds.size());
-        // Draw in board coordinates from here on.
-        frame.translate(frame.center() - Point::ORIGIN + self.camera.offset);
-        frame.rotate(self.camera.rotation);
-        frame.scale(self.camera.zoom);
+        self.camera.apply(&mut frame);
 
-        let size = self.board.size;
-        let top_left = Point::ORIGIN - Vector::new(size.width, size.height) * 0.5;
-        // Not `fill_rectangle`, which the wgpu renderer keeps axis-aligned,
-        // squashing the board when the camera is turned.
-        frame.fill(&canvas::Path::rectangle(top_left, size), Color::WHITE);
+        // A screen pixel, for marks as thick at any zoom.
+        let pixel = 1.0 / self.camera.zoom;
 
-        for item in self.items.iter().chain(&state.draft) {
-            item.draw(&mut frame);
+        if let Some(item) = self.selected.and_then(|index| self.items.get(index)) {
+            let outline = self.outline(item);
+            let line = canvas::Stroke::default()
+                .with_color(theme.extended_palette().primary.base.color)
+                .with_width(SELECTION_WIDTH * pixel);
+
+            frame.with_save(|frame| {
+                // In the item's own coordinates, so the outline turns with it.
+                frame.rotate(item.rotation);
+                frame.stroke(
+                    &canvas::Path::rectangle(outline.position(), outline.size()),
+                    line,
+                );
+
+                for (edit, at) in self.handles(item) {
+                    let handle = if edit == Edit::Turn {
+                        frame.stroke(&canvas::Path::line(Point::new(at.x, outline.y), at), line);
+                        canvas::Path::circle(at, HANDLE_SIZE / 2.0 * pixel)
+                    } else {
+                        let size = Size::new(HANDLE_SIZE, HANDLE_SIZE) * pixel;
+                        canvas::Path::rectangle(
+                            at - Vector::new(size.width, size.height) * 0.5,
+                            size,
+                        )
+                    };
+
+                    frame.fill(&handle, Color::WHITE);
+                    frame.stroke(&handle, line);
+                }
+            });
+        }
+
+        if let Some(draft) = &state.draft {
+            if let Some(item) = self.item(draft) {
+                item.draw(&mut frame);
+            }
+
+            let mark = canvas::Stroke::default()
+                .with_color(self.color)
+                .with_width(pixel);
+
+            match draft {
+                Draft::Drag {
+                    tool: Tool::Image,
+                    start,
+                    end,
+                } => {
+                    let area = enclosing([*start, *end]);
+                    let dash = [4.0 * pixel; 2];
+                    frame.stroke(
+                        &canvas::Path::rectangle(area.position(), area.size()),
+                        canvas::Stroke {
+                            line_dash: canvas::LineDash {
+                                segments: &dash,
+                                offset: 0,
+                            },
+                            ..mark
+                        },
+                    );
+                }
+                Draft::Path { points, cursor } => {
+                    if let Some(last) = points.last() {
+                        frame.stroke(&canvas::Path::line(*last, *cursor), stroke(self.color));
+                    }
+
+                    // Where clicking closes the path.
+                    if points.len() >= MIN_CORNERS {
+                        frame.stroke(
+                            &canvas::Path::circle(points[0], CLOSE_DISTANCE * pixel),
+                            mark,
+                        );
+                    }
+                }
+                Draft::Text { position, content } => {
+                    // After the last character, as text doesn't wrap.
+                    let (row, line) = content.split('\n').enumerate().last().unwrap_or_default();
+                    let line_height = TEXT_SIZE * TEXT_LINE_HEIGHT;
+                    let top = *position
+                        + Vector::new(text_size(line, TEXT_SIZE).width, row as f32 * line_height);
+
+                    frame.stroke(
+                        &canvas::Path::line(top, top + Vector::new(0.0, line_height)),
+                        mark.with_width(CARET_WIDTH * pixel),
+                    );
+                }
+                Draft::Drag { .. } | Draft::Stroke(_) => {}
+            }
         }
 
         vec![frame.into_geometry()]

@@ -4,4 +4,18 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-iced = { version = "0.14.0", features = ["canvas"] }
+base64 = "0.22"
+iced = { version = "0.14.0", features = ["advanced", "canvas", "image"] }
+image = "0.25"
+resvg = "0.45"
+rfd = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+
+# iced_wgpu 0.14.0 turns images by rotating their texture coordinates in atlas
+# space, which shears stretched images and scatters the tiles of images larger
+# than its 2048 px atlas, and it draws those tiles on quads turned the wrong
+# way, which crops them. The vendored copy fixes `src/shader/image.wgsl`.
+[patch.crates-io]
+iced_wgpu = { path = "vendor/iced_wgpu" }

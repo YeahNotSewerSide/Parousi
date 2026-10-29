@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Presentation</title>
+<style>
+  html,
+  body {
+    margin: 0;
+    height: 100%;
+    overflow: hidden;
+    background: #000;
+  }
+
+  canvas {
+    position: fixed;
+    inset: 0;
+    display: block;
+    width: 100%;
+    height: 100%;
+  }
+
+  nav {
+    position: fixed;
+    left: 50%;
+    bottom: calc(16px + env(safe-area-inset-bottom));
+    transform: translateX(-50%);
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 4px;
+    border-radius: 999px;
+    background: rgb(20 20 22 / 0.72);
+    box-shadow: 0 2px 12px rgb(0 0 0 / 0.3);
+    backdrop-filter: blur(8px);
+    color: #fff;
+    font: 500 14px/1 system-ui, sans-serif;
+    font-variant-numeric: tabular-nums;
+    user-select: none;
+  }
+
+  nav button {
+    display: grid;
+    place-items: center;
+    width: 44px;
+    height: 44px;
+    padding: 0;
+    border: 0;
+    border-radius: 50%;
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+  }
+
+  nav button:hover:not(:disabled) {
+    background: rgb(255 255 255 / 0.14);
+  }
+
+  nav button:active:not(:disabled) {
+    background: rgb(255 255 255 / 0.22);
+  }
+
+  nav button:focus-visible {
+    outline: 2px solid #fff;
+    outline-offset: -2px;
+  }
+
+  nav button:disabled {
+    opacity: 0.35;
+    cursor: default;
+  }
+
+  #counter {
+    min-width: 4.5em;
+    text-align: center;
+    opacity: 0.85;
+  }
+</style>
+</head>
+<body>
+<canvas></canvas>
+<nav>
+  <button id="previous" type="button" title="Previous (←)" aria-label="Previous frame">
+    <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12.5 4 6.5 10l6 6"/></svg>
+  </button>
+  <span id="counter" aria-live="polite"></span>
+  <button id="next" type="button" title="Next (→)" aria-label="Next frame">
+    <svg width="20" height="20" viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m7.5 4 6 6-6 6"/></svg>
+  </button>
+</nav>
+<script>
+"use strict";
+
+// Written by the editor on export. Cameras, items and sizes are in the
+// editor's units, and the drawing mirrors the editor's.
+const PRESENTATION = /* DATA */;
+
+const { view, board, frames, items, line, text, background, workspace } = PRESENTATION;
+
+const TAU = 2 * Math.PI;
+
+/**
+ * Map the elapsed fraction of a transition's time to the fraction of the way
+ * travelled, by transition kind.
+ */
+const EASINGS = {
+  linear: (time) => time,
+  // The integral of sin(πt), scaled to cover the way in time 1.
+  sine: (time) => (1 - Math.cos(Math.PI * time)) / 2,
+};
+
+const canvas = document.querySelector("canvas");
+const context = canvas.getContext("2d");
+const previousButton = document.getElementById("previous");
+const nextButton = document.getElementById("next");
+const counter = document.getElementById("counter");
+
+/** Index of the frame shown, or being moved to. */
+let current = 0;
+/** Camera move to the current frame, while a transition plays. */
+let flight = null;
+/** The background image, once it has loaded. */
+let backgroundImage = null;
+/** The images of image items, by item, once they have loaded. */
+const itemImages = new Map();
+let redrawRequested = false;
+
+/** `a` modulo `b`, never negative. */
+function remEuclid(a, b) {
+  return ((a % b) + b) % b;
+}
+
+/** Turns `[x, y]` clockwise on screen (where y points down) by `angle` radians. */
+function rotated([x, y], angle) {
+  const sin = Math.sin(angle);
+  const cos = Math.cos(angle);
+  return [x * cos - y * sin, x * sin + y * cos];
+}
+
+/** The board point `camera` shows at the screen center. */
+function centerOf(camera) {
+  const [x, y] = rotated([-camera.offset[0], -camera.offset[1]], -camera.rotation);
+  return [x / camera.zoom, y / camera.zoom];
+}
+
+/**
+ * The camera `amount` (0 to 1) of the way from `from` to `to`. The board point
+ * at the screen center moves in a straight line, the zoom changes by the same
+ * factor per step, and the board turns at a constant speed the short way round.
+ */
+function interpolate(from, to, amount) {
+  const [fromX, fromY] = centerOf(from);
+  const [toX, toY] = centerOf(to);
+  const x = fromX + (toX - fromX) * amount;
+  const y = fromY + (toY - fromY) * amount;
+  const zoom = from.zoom * (to.zoom / from.zoom) ** amount;
+  // Between -π and π, as turning past half a turn is the long way.
+  const turn = remEuclid(to.rotation - from.rotation + Math.PI, TAU) - Math.PI;
+  const rotation = remEuclid(from.rotation + turn * amount, TAU);
+
+  return { zoom, rotation, offset: rotated([-x * zoom, -y * zoom], rotation) };
+}
+
+/**
+ * `camera` as seen from a plane `depth` behind the board, which pans and zooms
+ * slower the further back it is.
+ */
+function behind(camera, depth) {
+  const zoom = 1 / (1 / camera.zoom + depth);
+  const ratio = zoom / camera.zoom;
+
+  return {
+    zoom,
+    rotation: camera.rotation,
+    offset: [camera.offset[0] * ratio, camera.offset[1] * ratio],
+  };
+}
+
+/** The camera the board is shown through: the current frame's, or one on its way there. */
+function camera() {
+  const target = frames[current].camera;
+  return flight ? interpolate(flight.from, target, flight.progress) : target;
+}
+
+/** Moves to frame `index` with the transition of the gap between it and the current frame. */
+function show(index) {
+  if (index < 0 || index >= frames.length || index === current) {
+    return;
+  }
+
+  // A frame owns the transition from the frame before it. Moving back crosses
+  // the gap after the target instead, so stepping back and forth between two
+  // frames plays the same transition both ways.
+  const { kind, duration } = frames[index > current ? index : index + 1].transition;
+
+  // Starting from the camera shown, rather than the previous frame's, keeps
+  // the move smooth when a transition is cut short.
+  flight =
+    kind !== "instant" && duration > 0
+      ? { from: camera(), ease: EASINGS[kind], duration: duration * 1000, start: null, progress: 0 }
+      : null;
+  current = index;
+
+  updateControls();
+  requestRedraw();
+}
+
+function updateControls() {
+  previousButton.disabled = current === 0;
+  nextButton.disabled = current === frames.length - 1;
+  counter.textContent = `${current + 1} / ${frames.length}`;
+}
+
+function requestRedraw() {
+  if (!redrawRequested) {
+    redrawRequested = true;
+    requestAnimationFrame(redraw);
+  }
+}
+
+/** Advances the transition playing, if any, to `now` and draws. */
+function redraw(now) {
+  redrawRequested = false;
+
+  if (flight) {
+    // It starts when it is first drawn.
+    flight.start ??= now;
+    const time = Math.min((now - flight.start) / flight.duration, 1);
+    flight.progress = flight.ease(time);
+
+    if (time >= 1) {
+      flight = null;
+    } else {
+      requestRedraw();
+    }
+  }
+
+  draw();
+}
+
+/**
+ * Makes the context draw in the coordinates `camera` looks at, with `scale`
+ * canvas pixels per editor pixel.
+ */
+function look(camera, scale) {
+  context.setTransform(scale, 0, 0, scale, canvas.width / 2, canvas.height / 2);
+  context.translate(camera.offset[0], camera.offset[1]);
+  context.rotate(camera.rotation);
+  context.scale(camera.zoom, camera.zoom);
+}
+
+function draw() {
+  const pixelRatio = window.devicePixelRatio;
+  const width = canvas.clientWidth;
+  const height = canvas.clientHeight;
+  const pixelWidth = Math.round(width * pixelRatio);
+  const pixelHeight = Math.round(height * pixelRatio);
+
+  if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
+    canvas.width = pixelWidth;
+    canvas.height = pixelHeight;
+  }
+
+  context.setTransform(1, 0, 0, 1, 0, 0);
+  context.fillStyle = workspace;
+  context.fillRect(0, 0, canvas.width, canvas.height);
+
+  // A frame looks as it did in the editor's workspace, scaled to fit the
+  // window. A window of another shape shows more around it.
+  const fit = Math.min(width / view[0], height / view[1]);
+  const shown = camera();
+
+  if (backgroundImage) {
+    look(behind(shown, background.depth), fit * pixelRatio);
+
+    const [backgroundWidth, backgroundHeight] = background.size;
+    context.drawImage(
+      backgroundImage,
+      -backgroundWidth / 2,
+      -backgroundHeight / 2,
+      backgroundWidth,
+      backgroundHeight,
+    );
+  }
+
+  look(shown, fit * pixelRatio);
+
+  // Unlike in the editor, a board the background shows through isn't
+  // outlined, so nothing but the drawings shows over the background.
+  if (!background) {
+    const [boardWidth, boardHeight] = board.size;
+    context.fillStyle = board.color;
+    context.fillRect(-boardWidth / 2, -boardHeight / 2, boardWidth, boardHeight);
+  }
+
+  context.lineWidth = line.width;
+  context.lineCap = "round";
+  context.lineJoin = "round";
+  context.textBaseline = "middle";
+
+  for (const item of items) {
+    // Each item draws in its own coordinates, turned around the board center.
+    context.save();
+    context.rotate(item.rotation);
+    context.strokeStyle = item.color;
+    context.fillStyle = item.color;
+
+    switch (item.type) {
+      case "polyline":
+        trace(item.points, item.closed);
+        context.stroke();
+        break;
+      case "arrow":
+        trace(item.shaft, false);
+        context.stroke();
+        trace(item.head, true);
+        context.fill();
+        break;
+      case "ellipse":
+        context.beginPath();
+        context.ellipse(...item.center, ...item.radii, 0, 0, TAU);
+        context.stroke();
+        break;
+      case "text": {
+        // Each line centered in its height, as in the editor.
+        const lineHeight = item.size * text.lineHeight;
+        const [x, y] = item.position;
+        context.font = `${item.size}px sans-serif`;
+        item.content.split("\n").forEach((content, row) => {
+          context.fillText(content, x, y + (row + 0.5) * lineHeight);
+        });
+        break;
+      }
+      case "image": {
+        const image = itemImages.get(item);
+        if (image) {
+          context.drawImage(image, ...item.bounds);
+        }
+        break;
+      }
+    }
+
+    context.restore();
+  }
+}
+
+/** Starts a path through `points`, back to the first one when `closed`. */
+function trace(points, closed) {
+  context.beginPath();
+  for (const point of points) {
+    context.lineTo(...point);
+  }
+  if (closed) {
+    context.closePath();
+  }
+}
+
+previousButton.addEventListener("click", () => show(current - 1));
+nextButton.addEventListener("click", () => show(current + 1));
+
+addEventListener("keydown", (event) => {
+  if (event.altKey || event.ctrlKey || event.metaKey) {
+    return;
+  }
+
+  switch (event.key) {
+    case "ArrowLeft":
+    case "PageUp":
+      show(current - 1);
+      break;
+    case "ArrowRight":
+    case "PageDown":
+      show(current + 1);
+      break;
+    default:
+      return;
+  }
+
+  event.preventDefault();
+});
+
+addEventListener("resize", requestRedraw);
+
+/** Loads the image at `url`, and draws again once `onLoad` has taken it. */
+function load(url, onLoad) {
+  const image = new Image();
+  image.addEventListener("load", () => {
+    onLoad(image);
+    requestRedraw();
+  });
+  image.src = url;
+}
+
+if (background) {
+  load(background.url, (image) => (backgroundImage = image));
+}
+
+for (const item of items) {
+  if (item.type === "image") {
+    load(item.url, (image) => itemImages.set(item, image));
+  }
+}
+
+updateControls();
+requestRedraw();
+</script>
+</body>
+</html>
