@@ -162,21 +162,6 @@ function interpolate(from, to, amount) {
   return { zoom, rotation, offset: rotated([-x * zoom, -y * zoom], rotation) };
 }
 
-/**
- * `camera` as seen from a plane `depth` behind the board, which pans and zooms
- * slower the further back it is.
- */
-function behind(camera, depth) {
-  const zoom = 1 / (1 / camera.zoom + depth);
-  const ratio = zoom / camera.zoom;
-
-  return {
-    zoom,
-    rotation: camera.rotation,
-    offset: [camera.offset[0] * ratio, camera.offset[1] * ratio],
-  };
-}
-
 /** The camera the board is shown through: the current frame's, or one on its way there. */
 function camera() {
   const target = frames[current].camera;
@@ -272,16 +257,7 @@ function draw() {
   const shown = camera();
 
   if (backgroundImage) {
-    look(behind(shown, background.depth), fit * pixelRatio);
-
-    const [backgroundWidth, backgroundHeight] = background.size;
-    context.drawImage(
-      backgroundImage,
-      -backgroundWidth / 2,
-      -backgroundHeight / 2,
-      backgroundWidth,
-      backgroundHeight,
-    );
+    drawBackground(shown);
   }
 
   look(shown, fit * pixelRatio);
@@ -309,7 +285,7 @@ function draw() {
     switch (item.type) {
       case "polyline":
         trace(item.points, item.closed);
-        context.stroke();
+        paint(item.filled);
         break;
       case "arrow":
         trace(item.shaft, false);
@@ -320,7 +296,7 @@ function draw() {
       case "ellipse":
         context.beginPath();
         context.ellipse(...item.center, ...item.radii, 0, 0, TAU);
-        context.stroke();
+        paint(item.filled);
         break;
       case "text": {
         // Each line centered in its height, as in the editor.
@@ -342,6 +318,54 @@ function draw() {
     }
 
     context.restore();
+  }
+}
+
+/**
+ * Draws the background over the whole window, drifting with `camera` as in the
+ * editor.
+ */
+function drawBackground(camera) {
+  const { width, height } = canvas;
+  const [imageWidth, imageHeight] = background.size;
+
+  // Larger than the window by the parallax, leaving it room to drift either
+  // way. Along a side the window crops more off, it drifts no further, so it
+  // drifts alike in any shape of window.
+  const parallax = background.parallax / 100;
+  const scale = Math.max(width / imageWidth, height / imageHeight) * (1 + parallax);
+  const drawnWidth = imageWidth * scale;
+  const drawnHeight = imageHeight * scale;
+
+  // Where the camera looks across the board, from -1 at one side to 1 at the
+  // other. Looking further out takes it no further.
+  const [x, y] = centerOf(camera);
+  const acrossX = Math.min(Math.max(x / (board.size[0] / 2), -1), 1);
+  const acrossY = Math.min(Math.max(y / (board.size[1] / 2), -1), 1);
+
+  // Like a far scene, it shifts the way the board does.
+  const middleX = width / 2 - (acrossX * width * parallax) / 2;
+  const middleY = height / 2 - (acrossY * height * parallax) / 2;
+
+  context.setTransform(1, 0, 0, 1, 0, 0);
+  context.drawImage(
+    backgroundImage,
+    middleX - drawnWidth / 2,
+    middleY - drawnHeight / 2,
+    drawnWidth,
+    drawnHeight,
+  );
+}
+
+/**
+ * Fills the path traced in when `filled`, by the even-odd rule as in the
+ * editor, or else outlines it.
+ */
+function paint(filled) {
+  if (filled) {
+    context.fill("evenodd");
+  } else {
+    context.stroke();
   }
 }
 

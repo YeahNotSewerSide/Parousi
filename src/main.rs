@@ -94,6 +94,17 @@ enum Tool {
     Image,
 }
 
+impl Tool {
+    /// Whether the tool draws closed shapes, which can be filled in, see
+    /// [`Parousi::filled`]. Paths are only once closed.
+    fn can_fill(self) -> bool {
+        matches!(
+            self,
+            Tool::Rectangle | Tool::Ellipse | Tool::Polygon | Tool::Star | Tool::Path
+        )
+    }
+}
+
 impl fmt::Display for Tool {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
@@ -125,6 +136,8 @@ const USAGE: [(&str, &[&str]); 8] = [
             "Text: click where it goes and type. Press Escape or click elsewhere to finish.",
             "Image: drag out an area, or just click, then pick a file.",
             "New items are drawn in the color picked under Color, or typed in as #rrggbb.",
+            "Tick Filled under Color to fill in new rectangles, ellipses, polygons, stars \
+             and closed paths, rather than outline them.",
         ],
     ),
     (
@@ -168,11 +181,10 @@ const USAGE: [(&str, &[&str]); 8] = [
         &[
             "Set the size of the board in the toolbar. With Aspect ratio ticked, changing one \
              side changes the other to match.",
-            "Background puts an image behind the board, five times as wide as it, and \
-             Remove takes it away. Set its size beside them: changing one side changes the other, so the image keeps \
-             its proportions.",
-            "Depth sets how far behind the board the background is. The further it is, the \
-             slower it moves as the camera does. At 0, it moves with the board.",
+            "Background puts an image behind the board, filling the screen, and Remove \
+             takes it away.",
+            "Parallax sets how far the background drifts as the camera moves from one side \
+             of the board to the other, in percent of the screen. At 0, it stays still.",
         ],
     ),
     (
@@ -226,6 +238,8 @@ enum Message {
     ColorPicked(Color),
     /// The color input was edited.
     ColorInputChanged(String),
+    /// Enables or disables filling in new closed shapes.
+    FilledToggled(bool),
     /// The corners input was edited.
     CornersChanged(String),
     FrameSelected(usize),
@@ -262,16 +276,10 @@ enum Message {
     },
     /// Opens a file dialog to pick the background image.
     PickBackground,
-    /// The picked background image has loaded, or failed to. It is to be
-    /// `width` wide.
-    BackgroundLoaded {
-        width: f32,
-        result: Result<Picture, image::Error>,
-    },
+    /// The picked background image has loaded, or failed to.
+    BackgroundLoaded(Result<Picture, image::Error>),
     RemoveBackground,
-    BackgroundWidthChanged(String),
-    BackgroundHeightChanged(String),
-    BackgroundDepthChanged(String),
+    BackgroundParallaxChanged(String),
     TransitionKindSelected {
         frame: usize,
         kind: TransitionKind,
@@ -319,6 +327,9 @@ struct Parousi {
     mode: Mode,
     tool: Tool,
     ink: Ink,
+    /// Whether the tools that draw closed shapes fill them in, rather than
+    /// outline them.
+    filled: bool,
     corners: Corners,
     /// Never empty, so there is always a camera to edit.
     frames: Vec<Frame>,
@@ -328,8 +339,8 @@ struct Parousi {
     items: Vec<Item>,
     /// Index of the item picked with [`Tool::Select`].
     selected: Option<usize>,
-    /// An image behind the board, moving slower than it for a sense of
-    /// depth. See [`Camera::behind`]. Shared by all frames.
+    /// An image filling the screen behind the board, drifting a little as
+    /// the camera moves for a sense of depth. Shared by all frames.
     background: Option<Background>,
     /// Camera move to the selected frame, while a transition plays.
     flight: Option<Flight>,
@@ -372,6 +383,7 @@ impl Parousi {
             mode: Mode::default(),
             tool: Tool::default(),
             ink: Ink::default(),
+            filled: false,
             corners: Corners::default(),
             frames: vec![Frame::default()],
             frame: 0,
@@ -422,11 +434,12 @@ impl Parousi {
                     self.selected = None;
                 }
             }
-            // Like the tool, the color and corners are how new items are
-            // drawn rather than part of the presentation, so they aren't
+            // Like the tool, the color, filling and corners are how new items
+            // are drawn rather than part of the presentation, so they aren't
             // undone.
             Message::ColorPicked(color) => self.ink = Ink::new(color),
             Message::ColorInputChanged(input) => self.ink.set_input(input),
+            Message::FilledToggled(filled) => self.filled = filled,
             Message::CornersChanged(input) => self.corners.set_input(input),
             Message::FrameSelected(frame) => {
                 // Editing the newly selected frame shouldn't merge into an
@@ -514,56 +527,30 @@ impl Parousi {
                 eprintln!("Couldn't load the image: {error}");
             }
             Message::PickBackground => {
-                let width = self.board_size.size.width * BACKGROUND_BOARD_WIDTHS;
-
-                return pick_picture("Background", move |size| background_scale(width, size))
-                    .map(move |result| Message::BackgroundLoaded { width, result });
+                return pick_picture("Background", background_scale).map(Message::BackgroundLoaded);
             }
-            Message::BackgroundLoaded {
-                width,
-                result: Ok(picture),
-            } => {
-                // A new image goes as deep as the one it replaces.
-                let depth = self
+            Message::BackgroundLoaded(Ok(picture)) => {
+                // A new image drifts as far as the one it replaces.
+                let parallax = self
                     .background
                     .as_ref()
-                    .map_or(DEFAULT_BACKGROUND_DEPTH, |background| background.depth);
+                    .map_or(DEFAULT_PARALLAX, |background| background.parallax);
 
                 self.perform(Action::Background {
                     from: self.background.clone(),
-                    to: Some(Background::new(picture, width, depth)),
+                    to: Some(Background::new(picture, parallax)),
                 });
             }
-            Message::BackgroundLoaded {
-                result: Err(error), ..
-            } => {
+            Message::BackgroundLoaded(Err(error)) => {
                 eprintln!("Couldn't load the background: {error}");
             }
             Message::RemoveBackground => self.perform(Action::Background {
                 from: self.background.clone(),
                 to: None,
             }),
-            Message::BackgroundWidthChanged(width) => {
+            Message::BackgroundParallaxChanged(parallax) => {
                 if let Some(from) = &self.background {
-                    let to = from.with_width(width);
-                    self.perform(Action::Background {
-                        from: Some(from.clone()),
-                        to: Some(to),
-                    });
-                }
-            }
-            Message::BackgroundHeightChanged(height) => {
-                if let Some(from) = &self.background {
-                    let to = from.with_height(height);
-                    self.perform(Action::Background {
-                        from: Some(from.clone()),
-                        to: Some(to),
-                    });
-                }
-            }
-            Message::BackgroundDepthChanged(depth) => {
-                if let Some(from) = &self.background {
-                    let to = from.with_depth(depth);
+                    let to = from.with_parallax(parallax);
                     self.perform(Action::Background {
                         from: Some(from.clone()),
                         to: Some(to),
@@ -942,10 +929,14 @@ impl Parousi {
         // into runs that a canvas each draws in order, see
         // [`Item::shares_canvas`].
         let background = self.background.as_ref().map(|background| {
-            Canvas::new(BackgroundView { background, camera })
-                .width(Fill)
-                .height(Fill)
-                .into()
+            Canvas::new(BackgroundView {
+                background,
+                board,
+                camera,
+            })
+            .width(Fill)
+            .height(Fill)
+            .into()
         });
 
         let board_view = BoardView {
@@ -970,6 +961,7 @@ impl Parousi {
             mode: self.mode,
             tool: self.tool,
             color: self.ink.color,
+            filled: self.filled,
             corners: self.corners.count,
         };
 
@@ -1043,7 +1035,8 @@ impl Parousi {
             .into()
     }
 
-    /// The preset colors to draw in, and an input for any other.
+    /// The preset colors to draw in, an input for any other, and whether to
+    /// fill closed shapes in with it.
     fn color_picker(&self) -> Element<'_, Message> {
         let swatches = COLORS.chunks(6).map(|colors| {
             Row::with_children(colors.iter().map(|&color| self.swatch(color)))
@@ -1065,10 +1058,15 @@ impl Parousi {
             .on_input(Message::ColorInputChanged)
             .style(input_style(self.ink.is_valid()));
 
+        let filled = checkbox(self.filled)
+            .label("Filled")
+            .on_toggle_maybe(self.tool.can_fill().then_some(Message::FilledToggled));
+
         column![
             text("Color").size(14),
             Column::with_children(swatches).spacing(8),
             row![shown, input].spacing(8).align_y(Center),
+            filled,
         ]
         .spacing(8)
         .into()
@@ -1180,8 +1178,10 @@ impl Parousi {
         .spacing(2);
 
         let has_background = self.background.is_some();
-        let background_side =
-            |side: fn(&Background) -> &str| self.background.as_ref().map_or("", side);
+        let parallax = self
+            .background
+            .as_ref()
+            .map_or("", |background| &background.parallax_input);
 
         let background = row![
             row![
@@ -1193,22 +1193,14 @@ impl Parousi {
             ]
             .spacing(2),
             row![
-                text("Size:"),
-                text_input("", background_side(|background| &background.width))
-                    .on_input_maybe(has_background.then_some(Message::BackgroundWidthChanged))
-                    .width(70),
-                text("×"),
-                text_input("", background_side(|background| &background.height))
-                    .on_input_maybe(has_background.then_some(Message::BackgroundHeightChanged))
-                    .width(70),
-            ]
-            .spacing(6)
-            .align_y(Center),
-            row![
-                text("Depth:"),
-                text_input("", background_side(|background| &background.depth_input))
-                    .on_input_maybe(has_background.then_some(Message::BackgroundDepthChanged))
+                text("Parallax:"),
+                text_input("", parallax)
+                    .on_input_maybe(has_background.then_some(Message::BackgroundParallaxChanged))
+                    .style(input_style(
+                        !has_background || parse_parallax(parallax).is_some()
+                    ))
                     .width(50),
+                text("%"),
             ]
             .spacing(6)
             .align_y(Center),
@@ -1476,13 +1468,12 @@ fn parse_side(input: &str) -> Option<f32> {
         .map(|side| side as f32)
 }
 
-/// A background depth, which can be any distance behind the board, but not
-/// in front of it.
-fn parse_depth(input: &str) -> Option<f32> {
+/// A background parallax, in percent, up to [`MAX_PARALLAX`].
+fn parse_parallax(input: &str) -> Option<f32> {
     input
         .parse::<f32>()
         .ok()
-        .filter(|depth| depth.is_finite() && *depth >= 0.0)
+        .filter(|parallax| (0.0..=MAX_PARALLAX).contains(parallax))
 }
 
 /// Rounds a side of the board worked out from the other to whole board
@@ -1630,8 +1621,8 @@ impl Action {
             (Action::BoardSize { to, .. }, Action::BoardSize { to: next, .. }) => {
                 *to = next.clone();
             }
-            // Typing a background's size or depth merges, but picking or
-            // removing the background is a step of its own.
+            // Typing a background's parallax merges, but picking or removing
+            // the background is a step of its own.
             (
                 Action::Background {
                     from: Some(from),
@@ -1805,24 +1796,6 @@ impl Camera {
         let zoom = (self.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
         self.offset = anchor - (anchor - self.offset) * (zoom / self.zoom);
         self.zoom = zoom;
-    }
-
-    /// The camera as seen from a plane `depth` behind the board (see
-    /// [`Background::depth`]), drawing in that plane's units.
-    ///
-    /// The camera is taken to hover `1 / zoom` above the board, so the plane
-    /// looks smaller by the ratio of their distances. Hence it pans and zooms
-    /// slower, the more so the closer the camera is to the board, but turns
-    /// all the same. As with real depth, the plane's point behind the board
-    /// point at the canvas center, or under a zoom anchor, stays behind it.
-    fn behind(self, depth: f32) -> Camera {
-        let zoom = 1.0 / (1.0 / self.zoom + depth);
-
-        Camera {
-            zoom,
-            rotation: self.rotation,
-            offset: self.offset * (zoom / self.zoom),
-        }
     }
 
     /// Makes `frame` draw in the coordinates the camera looks at.
@@ -2225,6 +2198,9 @@ enum Shape {
     Polyline {
         points: Vec<Point>,
         closed: bool,
+        /// Whether its inside is filled in rather than outlined, which only
+        /// a closed one's can be.
+        filled: bool,
         color: Color,
     },
     Arrow {
@@ -2235,6 +2211,8 @@ enum Shape {
     Ellipse {
         center: Point,
         radii: Vector,
+        /// Whether its inside is filled in rather than outlined.
+        filled: bool,
         color: Color,
     },
     /// Lines of text, with the top left corner of the first at `position`.
@@ -2256,8 +2234,9 @@ impl Shape {
             Shape::Polyline {
                 points,
                 closed,
+                filled,
                 color,
-            } => frame.stroke(&polyline(points, *closed), stroke(*color)),
+            } => paint(frame, &polyline(points, *closed), *color, *filled),
             Shape::Arrow { from, to, color } => {
                 let (base, head) = arrow_head(*from, *to);
                 frame.stroke(&canvas::Path::line(*from, base), stroke(*color));
@@ -2266,6 +2245,7 @@ impl Shape {
             Shape::Ellipse {
                 center,
                 radii,
+                filled,
                 color,
             } => {
                 let ellipse = canvas::Path::new(|builder| {
@@ -2278,7 +2258,7 @@ impl Shape {
                     });
                     builder.close();
                 });
-                frame.stroke(&ellipse, stroke(*color));
+                paint(frame, &ellipse, *color, *filled);
             }
             Shape::Text {
                 position,
@@ -2327,10 +2307,12 @@ impl Shape {
             Shape::Polyline {
                 points,
                 closed,
+                filled,
                 color,
             } => Shape::Polyline {
                 points: points.into_iter().map(map).collect(),
                 closed,
+                filled,
                 color,
             },
             Shape::Arrow { from, to, color } => Shape::Arrow {
@@ -2341,10 +2323,12 @@ impl Shape {
             Shape::Ellipse {
                 center,
                 radii,
+                filled,
                 color,
             } => Shape::Ellipse {
                 center: map(center),
                 radii: Vector::new(radii.x * factors.x, radii.y * factors.y),
+                filled,
                 color,
             },
             Shape::Text {
@@ -2427,6 +2411,23 @@ fn stroke(color: Color) -> canvas::Stroke<'static> {
         .with_width(LINE_WIDTH)
         .with_line_cap(canvas::LineCap::Round)
         .with_line_join(canvas::LineJoin::Round)
+}
+
+/// Fills `path` in with `color` when `filled`, or else outlines it. The fill
+/// goes by the even-odd rule, like [`encloses`], so a path crossing itself
+/// is hit where it shows filled.
+fn paint(frame: &mut canvas::Frame, path: &canvas::Path, color: Color, filled: bool) {
+    if filled {
+        frame.fill(
+            path,
+            canvas::Fill {
+                style: canvas::Style::Solid(color),
+                rule: canvas::fill::Rule::EvenOdd,
+            },
+        );
+    } else {
+        frame.stroke(path, stroke(color));
+    }
 }
 
 /// Straight segments through `points`, and back to the first one when
@@ -2522,8 +2523,15 @@ fn arrow_head(from: Point, to: Point) -> (Point, [Point; 3]) {
 /// The shape `tool` draws when dragged from `start` to `end`, unless it would
 /// be empty: a line or an arrow between them, a rectangle or an ellipse
 /// spanning them, or a polygon or a star centered at `start` with a corner
-/// at `end`.
-fn shape(tool: Tool, start: Point, end: Point, corners: usize, color: Color) -> Option<Shape> {
+/// at `end`. All but lines and arrows are filled in when `filled`.
+fn shape(
+    tool: Tool,
+    start: Point,
+    end: Point,
+    corners: usize,
+    color: Color,
+    filled: bool,
+) -> Option<Shape> {
     let span = enclosing([start, end]);
     let is_empty = match tool {
         Tool::Rectangle | Tool::Ellipse => span.width == 0.0 || span.height == 0.0,
@@ -2537,6 +2545,7 @@ fn shape(tool: Tool, start: Point, end: Point, corners: usize, color: Color) -> 
     let polygon = |dent| Shape::Polyline {
         points: polygon(start, end, corners, dent),
         closed: true,
+        filled,
         color,
     };
 
@@ -2544,6 +2553,7 @@ fn shape(tool: Tool, start: Point, end: Point, corners: usize, color: Color) -> 
         Tool::Line => Shape::Polyline {
             points: vec![start, end],
             closed: false,
+            filled: false,
             color,
         },
         Tool::Arrow => Shape::Arrow {
@@ -2559,11 +2569,13 @@ fn shape(tool: Tool, start: Point, end: Point, corners: usize, color: Color) -> 
                 Point::new(span.x, span.y + span.height),
             ],
             closed: true,
+            filled,
             color,
         },
         Tool::Ellipse => Shape::Ellipse {
             center: span.center(),
             radii: Vector::new(span.width, span.height) * 0.5,
+            filled,
             color,
         },
         Tool::Polygon => polygon(None),
@@ -2614,14 +2626,17 @@ fn fit(size: Size, area: Rectangle) -> Rectangle {
     )
 }
 
-/// Depth of a background picked while there is none, see
-/// [`Background::depth`].
-const DEFAULT_BACKGROUND_DEPTH: f32 = 1.0;
+/// Parallax of a background picked while there is none, see
+/// [`Background::parallax`].
+const DEFAULT_PARALLAX: f32 = 10.0;
 
-/// Width of a background when picked, centered behind the board, in
-/// multiples of the board's width. Its height follows from the image's
-/// proportions.
-const BACKGROUND_BOARD_WIDTHS: f32 = 5.0;
+/// Highest parallax, in percent, which bounds how large a vector background
+/// is rasterized, see [`background_scale`].
+const MAX_PARALLAX: f32 = 100.0;
+
+/// Size, in pixels, of the largest screen a vector background is rasterized
+/// to look sharp on: a 4K one.
+const SHARPEST_SCREEN: Size = Size::new(3840.0, 2160.0);
 
 /// File extensions of the raster images a picture can be, which the
 /// renderer decodes.
@@ -2638,18 +2653,16 @@ const VECTOR_EXTENSIONS: &[&str] = &["svg", "svgz"];
 /// tall images reach it, which would take up gigabytes otherwise.
 const MAX_RASTER_SIDE: f32 = 8192.0;
 
-/// Pixels per unit to rasterize a vector background of `size` at, drawn
-/// `width` wide: the size it takes up on screen at the highest zoom with the
-/// background right behind the board (at depth 0), so it never shows blurry,
-/// however its depth is set.
-fn background_scale(width: f32, size: Size) -> f32 {
-    let closest = Camera {
-        zoom: MAX_ZOOM,
-        ..Camera::default()
-    }
-    .behind(0.0);
+/// Pixels per unit to rasterize a vector background of `size` at: the size
+/// it is drawn at on [`SHARPEST_SCREEN`] with the highest parallax, so it
+/// never shows blurry, however the parallax is set.
+fn background_scale(size: Size) -> f32 {
+    cover_scale(size, SHARPEST_SCREEN) * (1.0 + MAX_PARALLAX / 100.0)
+}
 
-    width / size.width * closest.zoom
+/// Scale that makes something of `size` cover `area` without stretching.
+fn cover_scale(size: Size, area: Size) -> f32 {
+    (area.width / size.width).max(area.height / size.height)
 }
 
 /// Asks for an image file and loads it, see [`load_picture`].
@@ -2822,90 +2835,43 @@ impl Picture {
     }
 }
 
-/// The image behind the board, and the size and depth it is drawn at.
+/// The image filling the screen behind the board, and how far it drifts.
 #[derive(Debug, Clone, PartialEq)]
 struct Background {
     picture: Picture,
-    width: String,
-    height: String,
-    /// In whole units of the background's plane, keeping the picture's
-    /// proportions, as stretching an image rarely looks right. The inputs may
-    /// not form a valid size (e.g. mid-edit), in which case this keeps the
-    /// last valid one.
-    size: Size,
-    depth_input: String,
-    /// Distance behind the board, in multiples of the camera's distance to
-    /// the board at zoom 1. The further it is, the slower it moves, and at 0
-    /// it moves with the board. The input may not be a valid depth (e.g.
-    /// mid-edit), in which case this keeps the last valid one.
-    depth: f32,
+    parallax_input: String,
+    /// How far the background drifts as the camera moves from one side of
+    /// the board to the other, in percent of the screen. It is drawn that
+    /// much larger than it takes to cover the screen, so its edges never
+    /// show. The input may not be a valid parallax (e.g. mid-edit), in which
+    /// case this keeps the last valid one.
+    parallax: f32,
 }
 
 impl Background {
-    /// `picture` `width` wide, keeping its proportions, `depth` behind the
-    /// board.
-    fn new(picture: Picture, width: f32, depth: f32) -> Self {
-        let image = picture.size();
-        let size = Size::new(
-            round_side(width),
-            round_side(width * image.height / image.width),
-        );
-
+    fn new(picture: Picture, parallax: f32) -> Self {
         Self {
             picture,
-            width: size.width.to_string(),
-            height: size.height.to_string(),
-            size,
-            depth_input: depth.to_string(),
-            depth,
+            parallax_input: parallax.to_string(),
+            parallax,
         }
     }
 
-    /// With the depth input set to `input`.
-    fn with_depth(&self, input: String) -> Self {
+    /// With the parallax input set to `input`.
+    fn with_parallax(&self, input: String) -> Self {
         Self {
-            depth: parse_depth(&input).unwrap_or(self.depth),
-            depth_input: input,
+            parallax: parse_parallax(&input).unwrap_or(self.parallax),
+            parallax_input: input,
             ..self.clone()
         }
-    }
-
-    /// With the width input set to `input`, which the height follows.
-    fn with_width(&self, input: String) -> Self {
-        let mut next = Self {
-            width: input,
-            ..self.clone()
-        };
-
-        if let Some(width) = parse_side(&next.width) {
-            let image = self.picture.size();
-            next.size = Size::new(width, round_side(width * image.height / image.width));
-            next.height = next.size.height.to_string();
-        }
-
-        next
-    }
-
-    /// With the height input set to `input`, which the width follows.
-    fn with_height(&self, input: String) -> Self {
-        let mut next = Self {
-            height: input,
-            ..self.clone()
-        };
-
-        if let Some(height) = parse_side(&next.height) {
-            let image = self.picture.size();
-            next.size = Size::new(round_side(height * image.width / image.height), height);
-            next.width = next.size.width.to_string();
-        }
-
-        next
     }
 }
 
-/// Draws the background through the camera of the board drawn over it.
+/// Draws the background over the whole canvas, drifting with the camera of
+/// the board drawn over it.
 struct BackgroundView<'a> {
     background: &'a Background,
+    board: Board,
     camera: Camera,
 }
 
@@ -2921,10 +2887,28 @@ impl canvas::Program<Message> for BackgroundView<'_> {
         _cursor: mouse::Cursor,
     ) -> Vec<Geometry> {
         let mut frame = canvas::Frame::new(renderer, bounds.size());
-        self.camera.behind(self.background.depth).apply(&mut frame);
+        let screen = bounds.size();
+        let image = self.background.picture.size();
 
-        let size = self.background.size;
-        let top_left = Point::ORIGIN - Vector::new(size.width, size.height) * 0.5;
+        // Larger than the screen by the parallax, leaving it room to drift
+        // either way. Along a side the screen crops more off, it drifts no
+        // further, so it drifts alike in any shape of window.
+        let parallax = self.background.parallax / 100.0;
+        let size = image * (cover_scale(image, screen) * (1.0 + parallax));
+        let room = Vector::new(screen.width, screen.height) * (parallax * 0.5);
+
+        // Where the camera looks across the board, from -1 at one side to 1
+        // at the other. Looking further out takes it no further.
+        let center = self.camera.to_board(Vector::ZERO);
+        let half = self.board.size * 0.5;
+        let across = Vector::new(
+            (center.x / half.width).clamp(-1.0, 1.0),
+            (center.y / half.height).clamp(-1.0, 1.0),
+        );
+
+        // Like a far scene, it shifts the way the board does.
+        let middle = frame.center() - Vector::new(across.x * room.x, across.y * room.y);
+        let top_left = middle - Vector::new(size.width, size.height) * 0.5;
 
         frame.draw_image(
             Rectangle::new(top_left, size),
@@ -3228,6 +3212,8 @@ struct ToolView<'a> {
     tool: Tool,
     /// Color new items are drawn in.
     color: Color,
+    /// Whether new closed shapes are filled in, see [`Tool::can_fill`].
+    filled: bool,
     /// Corners of new polygons, and points of new stars.
     corners: usize,
 }
@@ -3251,11 +3237,14 @@ impl ToolView<'_> {
         let color = self.color;
 
         let shape = match draft {
-            Draft::Drag { tool, start, end } => shape(*tool, *start, *end, self.corners, color),
+            Draft::Drag { tool, start, end } => {
+                shape(*tool, *start, *end, self.corners, color, self.filled)
+            }
             Draft::Stroke(points) | Draft::Path { points, .. } => {
                 (points.len() > 1).then(|| Shape::Polyline {
                     points: points.clone(),
                     closed: false,
+                    filled: false,
                     color,
                 })
             }
@@ -3526,6 +3515,7 @@ impl ToolView<'_> {
                     canvas::Action::publish(Message::ItemDrawn(Item::new(Shape::Polyline {
                         points,
                         closed: true,
+                        filled: self.filled,
                         color: self.color,
                     })))
                 } else if click.kind() == click::Kind::Double {

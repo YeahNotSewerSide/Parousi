@@ -142,11 +142,12 @@ impl Presentation {
 
         let background = match &self.background {
             Some(background) => {
-                let size = background.size;
+                // The page can't always tell the size of a vector image.
+                let size = background.picture.size();
                 json!({
                     "url": background.picture.file.to_url()?,
                     "size": [size.width, size.height],
-                    "depth": background.depth,
+                    "parallax": background.parallax,
                 })
             }
             None => Value::Null,
@@ -186,11 +187,13 @@ fn item_json(item: &Item) -> io::Result<Value> {
         Shape::Polyline {
             points,
             closed,
+            filled,
             color,
         } => json!({
             "type": "polyline",
             "points": points.iter().copied().map(point).collect::<Vec<_>>(),
             "closed": closed,
+            "filled": filled,
             "color": color.to_string(),
         }),
         Shape::Arrow { from, to, color } => {
@@ -205,11 +208,13 @@ fn item_json(item: &Item) -> io::Result<Value> {
         Shape::Ellipse {
             center,
             radii,
+            filled,
             color,
         } => json!({
             "type": "ellipse",
             "center": point(*center),
             "radii": [radii.x, radii.y],
+            "filled": filled,
             "color": color.to_string(),
         }),
         Shape::Text {

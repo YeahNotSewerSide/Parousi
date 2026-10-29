@@ -21,8 +21,9 @@ use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 use crate::export::{self, ImageFile};
 use crate::{
-    AspectRatio, Background, BoardSize, Camera, Frame, Item, MAX_ZOOM, Picture, Presentation,
-    Shape, Transition, TransitionKind, background_scale, parse_color, rasterize_svg,
+    AspectRatio, Background, BoardSize, Camera, DEFAULT_PARALLAX, Frame, Item, MAX_PARALLAX,
+    MAX_ZOOM, Picture, Presentation, Shape, Transition, TransitionKind, background_scale,
+    parse_color, rasterize_svg,
 };
 
 /// Extension of a saved presentation's file.
@@ -72,15 +73,14 @@ struct SavedBoard {
 #[derive(Serialize, Deserialize)]
 struct SavedBackground {
     image: String,
-    size: [f32; 2],
-    /// Files from before the depth could be set have the background at the
-    /// depth it then was.
-    #[serde(default = "fixed_background_depth")]
-    depth: f32,
+    /// See [`Background::parallax`]. Files from before it could be set have
+    /// the one a background is picked with.
+    #[serde(default = "default_parallax")]
+    parallax: f32,
 }
 
-fn fixed_background_depth() -> f32 {
-    2.0
+fn default_parallax() -> f32 {
+    DEFAULT_PARALLAX
 }
 
 #[derive(Serialize, Deserialize)]
@@ -125,6 +125,9 @@ enum SavedShape {
     Polyline {
         points: Vec<[f32; 2]>,
         closed: bool,
+        /// Files from before shapes could be filled have none filled.
+        #[serde(default)]
+        filled: bool,
         color: String,
     },
     Arrow {
@@ -135,6 +138,8 @@ enum SavedShape {
     Ellipse {
         center: [f32; 2],
         radii: [f32; 2],
+        #[serde(default)]
+        filled: bool,
         color: String,
     },
     Text {
@@ -167,8 +172,7 @@ impl Presentation {
             },
             background: self.background.as_ref().map(|background| SavedBackground {
                 image: images.add(&background.picture.file),
-                size: [background.size.width, background.size.height],
-                depth: background.depth,
+                parallax: background.parallax,
             }),
             frames: self.frames.iter().map(SavedFrame::new).collect(),
             items: self
@@ -310,10 +314,12 @@ impl SavedItem {
             Shape::Polyline {
                 points,
                 closed,
+                filled,
                 color,
             } => SavedShape::Polyline {
                 points: points.iter().copied().map(point).collect(),
                 closed: *closed,
+                filled: *filled,
                 color: color.to_string(),
             },
             Shape::Arrow { from, to, color } => SavedShape::Arrow {
@@ -324,10 +330,12 @@ impl SavedItem {
             Shape::Ellipse {
                 center,
                 radii,
+                filled,
                 color,
             } => SavedShape::Ellipse {
                 center: point(*center),
                 radii: [radii.x, radii.y],
+                filled: *filled,
                 color: color.to_string(),
             },
             Shape::Text {
@@ -363,12 +371,20 @@ impl SavedItem {
             SavedShape::Polyline {
                 points,
                 closed,
+                filled,
                 color: hex,
-            } => Shape::Polyline {
-                points: points.iter().copied().map(point).collect(),
-                closed: *closed,
-                color: color(hex)?,
-            },
+            } => {
+                if *filled && !*closed {
+                    return Err(invalid("an open polyline is filled"));
+                }
+
+                Shape::Polyline {
+                    points: points.iter().copied().map(point).collect(),
+                    closed: *closed,
+                    filled: *filled,
+                    color: color(hex)?,
+                }
+            }
             SavedShape::Arrow {
                 from,
                 to,
@@ -381,10 +397,12 @@ impl SavedItem {
             SavedShape::Ellipse {
                 center,
                 radii: [x, y],
+                filled,
                 color: hex,
             } => Shape::Ellipse {
                 center: point(*center),
                 radii: Vector::new(*x, *y),
+                filled: *filled,
                 color: color(hex)?,
             },
             SavedShape::Text {
@@ -521,21 +539,16 @@ impl Opened {
 
         let background = match &manifest.background {
             Some(background) => {
-                let size = sides(background.size)?;
-                let depth = background.depth;
+                let parallax = background.parallax;
 
-                if !(depth >= 0.0 && depth.is_finite()) {
-                    return Err(invalid(format!("invalid background depth {depth}")));
+                if !(0.0..=MAX_PARALLAX).contains(&parallax) {
+                    return Err(invalid(format!("invalid background parallax {parallax}")));
                 }
 
-                Some(Background {
-                    picture: pictures[background.image.as_str()].clone(),
-                    width: size.width.to_string(),
-                    height: size.height.to_string(),
-                    size,
-                    depth_input: depth.to_string(),
-                    depth,
-                })
+                Some(Background::new(
+                    pictures[background.image.as_str()].clone(),
+                    parallax,
+                ))
             }
             None => None,
         };
@@ -570,10 +583,10 @@ impl Opened {
 impl Manifest {
     /// Each use of an image, by the image's name.
     fn image_uses(&self) -> impl Iterator<Item = (&str, Usage)> {
-        let background = self.background.iter().map(|background| {
-            let width = background.size[0];
-            (background.image.as_str(), Usage::Background { width })
-        });
+        let background = self
+            .background
+            .iter()
+            .map(|background| (background.image.as_str(), Usage::Background));
 
         let items = self.items.iter().filter_map(|item| match &item.shape {
             SavedShape::Image { bounds, image } => {
@@ -588,7 +601,7 @@ impl Manifest {
 
 /// Where an image is shown, which tells how sharp it has to be.
 enum Usage {
-    Background { width: f32 },
+    Background,
     Item { width: f32 },
 }
 
@@ -597,7 +610,7 @@ impl Usage {
     /// was picked.
     fn scale(&self, size: Size) -> f32 {
         match *self {
-            Usage::Background { width } => background_scale(width, size),
+            Usage::Background => background_scale(size),
             Usage::Item { width } => width / size.width * MAX_ZOOM,
         }
     }
