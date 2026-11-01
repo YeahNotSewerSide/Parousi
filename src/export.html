@@ -96,7 +96,7 @@
 // editor's units, and the drawing mirrors the editor's.
 const PRESENTATION = /* DATA */;
 
-const { view, board, frames, items, line, text, background, workspace } = PRESENTATION;
+const { view, board, frames, items, line, text, fonts, background, workspace } = PRESENTATION;
 
 const TAU = 2 * Math.PI;
 
@@ -257,13 +257,13 @@ function draw() {
   const shown = camera();
 
   if (backgroundImage) {
-    drawBackground(shown);
+    drawBackground(shown, fit * pixelRatio);
   }
 
   look(shown, fit * pixelRatio);
 
-  // Unlike in the editor, a board the background shows through isn't
-  // outlined, so nothing but the drawings shows over the background.
+  // As in the editor, a background takes the place of the board, so nothing
+  // but the drawings shows over it.
   if (!background) {
     const [boardWidth, boardHeight] = board.size;
     context.fillStyle = board.color;
@@ -302,7 +302,7 @@ function draw() {
         // Each line centered in its height, as in the editor.
         const lineHeight = item.size * text.lineHeight;
         const [x, y] = item.position;
-        context.font = `${item.size}px sans-serif`;
+        context.font = `${item.size}px ${item.font}`;
         item.content.split("\n").forEach((content, row) => {
           context.fillText(content, x, y + (row + 0.5) * lineHeight);
         });
@@ -322,20 +322,27 @@ function draw() {
 }
 
 /**
- * Draws the background over the whole window, drifting with `camera` as in the
- * editor.
+ * Draws the background over the whole window, drifting and zooming with
+ * `camera`, which shows the board at `scale` canvas pixels per editor pixel,
+ * as in the editor.
  */
-function drawBackground(camera) {
+function drawBackground(camera, scale) {
   const { width, height } = canvas;
   const [imageWidth, imageHeight] = background.size;
+  const [boardWidth, boardHeight] = board.size;
 
   // Larger than the window by the parallax, leaving it room to drift either
   // way. Along a side the window crops more off, it drifts no further, so it
   // drifts alike in any shape of window.
   const parallax = background.parallax / 100;
-  const scale = Math.max(width / imageWidth, height / imageHeight) * (1 + parallax);
-  const drawnWidth = imageWidth * scale;
-  const drawnHeight = imageHeight * scale;
+
+  // Zoomed in closer than the whole board, it grows too.
+  const fitsBoard = Math.min(width / boardWidth, height / boardHeight);
+  const zoom = backgroundZoom((camera.zoom * scale) / fitsBoard, parallax);
+
+  const drawn = Math.max(width / imageWidth, height / imageHeight) * (1 + parallax) * zoom;
+  const drawnWidth = imageWidth * drawn;
+  const drawnHeight = imageHeight * drawn;
 
   // Where the camera looks across the board, from -1 at one side to 1 at the
   // other. Looking further out takes it no further.
@@ -343,9 +350,11 @@ function drawBackground(camera) {
   const acrossX = Math.min(Math.max(x / (board.size[0] / 2), -1), 1);
   const acrossY = Math.min(Math.max(y / (board.size[1] / 2), -1), 1);
 
-  // Like a far scene, it shifts the way the board does.
-  const middleX = width / 2 - (acrossX * width * parallax) / 2;
-  const middleY = height / 2 - (acrossY * height * parallax) / 2;
+  // Like a far scene, it shifts the way the board does. It grows around the
+  // middle of the window, so the point there stays put, and its shift grows
+  // with it, which leaves its edges as far out of sight.
+  const middleX = width / 2 - (acrossX * width * parallax * zoom) / 2;
+  const middleY = height / 2 - (acrossY * height * parallax * zoom) / 2;
 
   context.setTransform(1, 0, 0, 1, 0, 0);
   context.drawImage(
@@ -355,6 +364,19 @@ function drawBackground(camera) {
     drawnWidth,
     drawnHeight,
   );
+}
+
+/**
+ * How many times larger than zoomed out the background is drawn, with
+ * `parallax` from 0 to 1 and the camera `zoom` times as close as the one that
+ * fits the board in the window. As in the editor, it zooms in by the
+ * `background.zoomPower` of the camera's zoom, never shrinks past zoomed out,
+ * and grows up to `background.maxScale` times the scale that covers the
+ * window.
+ */
+function backgroundZoom(zoom, parallax) {
+  const most = background.maxScale / (1 + parallax);
+  return Math.max(Math.min(zoom ** background.zoomPower, most), 1);
 }
 
 /**
@@ -424,6 +446,13 @@ for (const item of items) {
   if (item.type === "image") {
     load(item.url, (image) => itemImages.set(item, image));
   }
+}
+
+// Text shows in another font until its own has loaded.
+for (const { family, url } of fonts) {
+  const font = new FontFace(family, `url(${url})`);
+  document.fonts.add(font);
+  font.load().then(requestRedraw);
 }
 
 updateControls();

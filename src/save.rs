@@ -1,6 +1,6 @@
 //! Saving the presentation to a file and opening it again. The file is a ZIP
 //! archive of `presentation.json`, which describes the presentation, beside
-//! the files of its images.
+//! the files of its images and fonts.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -20,6 +20,7 @@ use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 use crate::export::{self, ImageFile};
+use crate::typeface::{FontFile, Typeface};
 use crate::{
     AspectRatio, Background, BoardSize, Camera, DEFAULT_PARALLAX, Frame, Item, MAX_PARALLAX,
     MAX_ZOOM, Picture, Presentation, Shape, Transition, TransitionKind, background_scale,
@@ -146,6 +147,10 @@ enum SavedShape {
         position: [f32; 2],
         content: String,
         size: f32,
+        /// None for the default font, which files from before fonts could be
+        /// picked write in.
+        #[serde(default)]
+        font: Option<SavedFont>,
         color: String,
     },
     Image {
@@ -155,11 +160,22 @@ enum SavedShape {
     },
 }
 
+/// A [`Typeface`] other than the default.
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum SavedFont {
+    /// An installed font, by family name.
+    System(String),
+    /// A font file in the archive, by name.
+    File(String),
+}
+
 impl Presentation {
     /// Writes the presentation to `path`, replacing the file there only once
     /// it is written in full.
     pub fn save(&self, path: &Path) -> io::Result<()> {
         let mut images = Images::default();
+        let mut fonts = Fonts::default();
         let board_size = &self.board_size;
 
         let manifest = Manifest {
@@ -178,7 +194,7 @@ impl Presentation {
             items: self
                 .items
                 .iter()
-                .map(|item| SavedItem::new(item, &mut images))
+                .map(|item| SavedItem::new(item, &mut images, &mut fonts))
                 .collect(),
         };
 
@@ -194,6 +210,11 @@ impl Presentation {
                 ImageFile::Raster { data, .. } => data,
                 ImageFile::Vector(svg) => svg.as_bytes(),
             })?;
+        }
+
+        for (name, file) in &fonts.0 {
+            archive.start_file(name, options)?;
+            archive.write_all(&file.data)?;
         }
 
         let archive = archive.finish()?.into_inner();
@@ -242,6 +263,24 @@ impl Images {
         };
 
         let name = format!("images/{}.{extension}", self.0.len());
+        self.0.push((name.clone(), file.clone()));
+        name
+    }
+}
+
+/// The font files to write into the archive, each once however much text is
+/// written in it, by name.
+#[derive(Default)]
+struct Fonts(Vec<(String, Arc<FontFile>)>);
+
+impl Fonts {
+    /// Name of `file` in the archive, adding it unless it already is.
+    fn add(&mut self, file: &Arc<FontFile>) -> String {
+        if let Some((name, _)) = self.0.iter().find(|(_, added)| added == file) {
+            return name.clone();
+        }
+
+        let name = format!("fonts/{}.{}", self.0.len(), file.extension());
         self.0.push((name.clone(), file.clone()));
         name
     }
@@ -307,7 +346,7 @@ impl SavedFrame {
 }
 
 impl SavedItem {
-    fn new(item: &Item, images: &mut Images) -> Self {
+    fn new(item: &Item, images: &mut Images, fonts: &mut Fonts) -> Self {
         let point = |point: Point| [point.x, point.y];
 
         let shape = match &item.shape {
@@ -342,11 +381,17 @@ impl SavedItem {
                 position,
                 content,
                 size,
+                typeface,
                 color,
             } => SavedShape::Text {
                 position: point(*position),
                 content: content.clone(),
                 size: *size,
+                font: match typeface {
+                    Typeface::Default => None,
+                    Typeface::System(family) => Some(SavedFont::System((*family).to_owned())),
+                    Typeface::File(file) => Some(SavedFont::File(fonts.add(file))),
+                },
                 color: color.to_string(),
             },
             Shape::Image { bounds, picture } => SavedShape::Image {
@@ -361,7 +406,11 @@ impl SavedItem {
         }
     }
 
-    fn to_item(&self, pictures: &HashMap<&str, Picture>) -> io::Result<Item> {
+    fn to_item(
+        &self,
+        pictures: &HashMap<&str, Picture>,
+        fonts: &HashMap<String, Arc<FontFile>>,
+    ) -> io::Result<Item> {
         let point = |[x, y]: [f32; 2]| Point::new(x, y);
         let color = |color: &str| {
             parse_color(color).ok_or_else(|| invalid(format!("invalid color {color:?}")))
@@ -409,11 +458,17 @@ impl SavedItem {
                 position,
                 content,
                 size,
+                font,
                 color: hex,
             } => Shape::Text {
                 position: point(*position),
                 content: content.clone(),
                 size: *size,
+                typeface: match font {
+                    None => Typeface::Default,
+                    Some(SavedFont::System(family)) => Typeface::system(family),
+                    Some(SavedFont::File(name)) => Typeface::File(fonts[name.as_str()].clone()),
+                },
                 color: color(hex)?,
             },
             SavedShape::Image {
@@ -432,12 +487,15 @@ impl SavedItem {
     }
 }
 
-/// A presentation read from a file, whose images have yet to be allocated.
+/// A presentation read from a file, whose images have yet to be allocated,
+/// and fonts loaded.
 pub struct Opened {
     manifest: Manifest,
     /// Each image file the presentation uses, by name, ready for the
     /// renderer.
     images: Vec<(String, image::Handle, ImageFile)>,
+    /// Each font file the presentation uses, by name.
+    fonts: HashMap<String, Arc<FontFile>>,
 }
 
 /// Reads the presentation saved at `path`, preparing its images for the
@@ -490,18 +548,42 @@ pub fn open(path: &Path) -> io::Result<Opened> {
         })
         .collect::<io::Result<_>>()?;
 
-    Ok(Opened { manifest, images })
+    let mut fonts = HashMap::new();
+
+    for name in manifest.font_files() {
+        if let Entry::Vacant(entry) = fonts.entry(name.to_owned()) {
+            let font = FontFile::new(read(&mut archive, name)?.into())
+                .map_err(|error| invalid(format!("{name}: {error}")))?;
+            entry.insert(Arc::new(font));
+        }
+    }
+
+    Ok(Opened {
+        manifest,
+        images,
+        fonts,
+    })
 }
 
 impl Opened {
-    /// Allocates the images, so they show as soon as the presentation does,
-    /// then puts the presentation together.
+    /// Loads the fonts and allocates the images, so they show as soon as the
+    /// presentation does, then puts the presentation together.
     pub fn allocate(self) -> Task<Result<Presentation, Arc<io::Error>>> {
-        self.images
+        let fonts = self
+            .fonts
+            .values()
+            .map(|font| font.load())
+            .fold(Task::none(), Task::chain);
+
+        let images = self
+            .images
             .iter()
             .map(|(_, handle, _)| image::allocate(handle.clone()))
             .fold(Task::none(), Task::chain)
-            .collect()
+            .collect();
+
+        fonts
+            .chain(images)
             .map(move |allocations| self.assemble(allocations).map_err(Arc::new))
     }
 
@@ -573,7 +655,7 @@ impl Opened {
             items: manifest
                 .items
                 .iter()
-                .map(|item| item.to_item(&pictures))
+                .map(|item| item.to_item(&pictures, &self.fonts))
                 .collect::<io::Result<_>>()?,
             background,
         })
@@ -596,6 +678,17 @@ impl Manifest {
         });
 
         background.chain(items)
+    }
+
+    /// The name of the font file of each text written in one.
+    fn font_files(&self) -> impl Iterator<Item = &str> {
+        self.items.iter().filter_map(|item| match &item.shape {
+            SavedShape::Text {
+                font: Some(SavedFont::File(name)),
+                ..
+            } => Some(name.as_str()),
+            _ => None,
+        })
     }
 }
 

@@ -1,5 +1,6 @@
 mod export;
 mod save;
+mod typeface;
 
 use std::collections::VecDeque;
 use std::f32::consts::{FRAC_PI_2, PI, TAU};
@@ -20,8 +21,8 @@ use iced::time::{Duration, Instant};
 use iced::widget::canvas::{self, Canvas, Event, Geometry};
 use iced::widget::text::LineHeight;
 use iced::widget::{
-    Column, Row, Stack, button, checkbox, column, container, image, pick_list, row, rule,
-    scrollable, sensor, space, text, text_input,
+    Column, Row, Stack, button, checkbox, column, combo_box, container, image, pick_list, row,
+    rule, scrollable, sensor, space, text, text_input,
 };
 use iced::{
     Border, Center, Color, Element, Fill, Font, Point, Radians, Rectangle, Renderer, Size,
@@ -30,6 +31,7 @@ use iced::{
 use resvg::{tiny_skia, usvg};
 
 use export::ImageFile;
+use typeface::{FontFile, Typeface};
 
 const THEME: Theme = Theme::Dark;
 
@@ -134,6 +136,8 @@ const USAGE: [(&str, &[&str]); 8] = [
             "Path: click to add points. Double-click or press Enter to finish, click the first \
              point to close it, or press Escape to drop it.",
             "Text: click where it goes and type. Press Escape or click elsewhere to finish.",
+            "New text is written at the size and in the font set under Text. Pick an installed \
+             font, or load one from a .ttf or .otf file with Font file.",
             "Image: drag out an area, or just click, then pick a file.",
             "New items are drawn in the color picked under Color, or typed in as #rrggbb.",
             "Tick Filled under Color to fill in new rectangles, ellipses, polygons, stars \
@@ -147,6 +151,8 @@ const USAGE: [(&str, &[&str]); 8] = [
             "Drag a square handle to resize it. Shift keeps its proportions.",
             "Drag the round handle to turn it. Shift turns it in 15° steps.",
             "Delete or Backspace deletes the selected item, and Escape deselects it.",
+            "While an item is selected, Color and Text set its color, whether it is filled in, \
+             and the size and font of text, rather than those of new items.",
         ],
     ),
     (
@@ -181,10 +187,12 @@ const USAGE: [(&str, &[&str]); 8] = [
         &[
             "Set the size of the board in the toolbar. With Aspect ratio ticked, changing one \
              side changes the other to match.",
-            "Background puts an image behind the board, filling the screen, and Remove \
-             takes it away.",
+            "Background fills the screen with an image in place of the board, so only the \
+             drawings show over it, and Remove takes it away.",
             "Parallax sets how far the background drifts as the camera moves from one side \
-             of the board to the other, in percent of the screen. At 0, it stays still.",
+             of the board to the other, in percent of the screen. At 0, it stays put.",
+            "As the camera zooms in past the whole board, the background zooms in too, though \
+             less, as if far behind it.",
         ],
     ),
     (
@@ -193,6 +201,9 @@ const USAGE: [(&str, &[&str]); 8] = [
             "Save keeps the presentation in a .parousi file, asking where the first time, and \
              Open opens one to go on editing it.",
             "Ctrl+S saves, Ctrl+Shift+S saves to another file, and Ctrl+O opens.",
+            "Fonts loaded from files are kept in the presentation, so text shows in them \
+             anywhere. Installed fonts are kept by name, so where one isn't installed, its text \
+             shows in another font.",
         ],
     ),
     (
@@ -234,12 +245,20 @@ enum Message {
     BoardHeightChanged(String),
     ModeSelected(Mode),
     ToolSelected(Tool),
-    /// A color from [`COLORS`] was picked to draw in.
+    /// A color from [`COLORS`] was picked, for the selected item or new
+    /// ones, like the rest of the [`Style`].
     ColorPicked(Color),
     /// The color input was edited.
     ColorInputChanged(String),
-    /// Enables or disables filling in new closed shapes.
+    /// Enables or disables filling in closed shapes.
     FilledToggled(bool),
+    /// The text size input was edited.
+    TextSizeChanged(String),
+    TypefacePicked(Typeface),
+    /// Opens a file dialog to pick a font file to write text in.
+    PickFontFile,
+    /// The picked font file has been read and loaded, or failed to be.
+    FontFileLoaded(Result<Arc<FontFile>, Arc<io::Error>>),
     /// The corners input was edited.
     CornersChanged(String),
     FrameSelected(usize),
@@ -326,11 +345,15 @@ struct Parousi {
     keep_aspect_ratio: bool,
     mode: Mode,
     tool: Tool,
-    ink: Ink,
-    /// Whether the tools that draw closed shapes fill them in, rather than
-    /// outline them.
-    filled: bool,
+    /// How new items are drawn.
+    style: Style,
+    /// The selected item's style as the panel shows it, with its inputs as
+    /// typed. Changing it changes the item.
+    selection_style: Style,
     corners: Corners,
+    /// Fonts to pick for text: the default, the font files loaded to write
+    /// in, then the installed fonts.
+    typefaces: combo_box::State<Typeface>,
     /// Never empty, so there is always a camera to edit.
     frames: Vec<Frame>,
     /// Index of the selected frame.
@@ -339,8 +362,9 @@ struct Parousi {
     items: Vec<Item>,
     /// Index of the item picked with [`Tool::Select`].
     selected: Option<usize>,
-    /// An image filling the screen behind the board, drifting a little as
-    /// the camera moves for a sense of depth. Shared by all frames.
+    /// An image filling the screen in place of the board, drifting and
+    /// zooming a little as the camera moves for a sense of depth. Shared by
+    /// all frames.
     background: Option<Background>,
     /// Camera move to the selected frame, while a transition plays.
     flight: Option<Flight>,
@@ -382,9 +406,14 @@ impl Parousi {
             keep_aspect_ratio: true,
             mode: Mode::default(),
             tool: Tool::default(),
-            ink: Ink::default(),
-            filled: false,
+            style: Style::default(),
+            selection_style: Style::default(),
             corners: Corners::default(),
+            typefaces: combo_box::State::new(
+                iter::once(Typeface::Default)
+                    .chain(typeface::installed())
+                    .collect(),
+            ),
             frames: vec![Frame::default()],
             frame: 0,
             items: Vec::new(),
@@ -434,12 +463,41 @@ impl Parousi {
                     self.selected = None;
                 }
             }
-            // Like the tool, the color, filling and corners are how new items
-            // are drawn rather than part of the presentation, so they aren't
-            // undone.
-            Message::ColorPicked(color) => self.ink = Ink::new(color),
-            Message::ColorInputChanged(input) => self.ink.set_input(input),
-            Message::FilledToggled(filled) => self.filled = filled,
+            // Typing goes on with an edit of the selected item, but picking is
+            // an edit of its own.
+            Message::ColorPicked(color) => self.restyle_once(|style| style.ink = Ink::new(color)),
+            Message::ColorInputChanged(input) => self.restyle(|style| style.ink.set_input(input)),
+            Message::FilledToggled(filled) => self.restyle_once(|style| style.filled = filled),
+            Message::TextSizeChanged(input) => {
+                self.restyle(|style| style.text_size.set_input(input));
+            }
+            Message::TypefacePicked(typeface) => {
+                self.restyle_once(|style| style.typeface = typeface);
+            }
+            Message::PickFontFile => {
+                let dialog = rfd::AsyncFileDialog::new()
+                    .set_title("Font")
+                    .add_filter("Fonts", typeface::EXTENSIONS)
+                    .pick_file();
+
+                return Task::future(async move {
+                    let path = dialog.await?.path().to_owned();
+                    Some(FontFile::read(&path).map(Arc::new).map_err(Arc::new))
+                })
+                .and_then(Task::done)
+                // Before it is picked, so text shows in it right away.
+                .and_then(|file| file.load().chain(Task::done(Ok(file))))
+                .map(Message::FontFileLoaded);
+            }
+            Message::FontFileLoaded(Ok(file)) => {
+                let file = self.add_font_file(file);
+                self.restyle_once(|style| style.typeface = Typeface::File(file));
+            }
+            Message::FontFileLoaded(Err(error)) => {
+                eprintln!("Couldn't load the font: {error}");
+            }
+            // Like the tool, the corners are how new items are drawn rather
+            // than part of the presentation, so they aren't undone.
             Message::CornersChanged(input) => self.corners.set_input(input),
             Message::FrameSelected(frame) => {
                 // Editing the newly selected frame shouldn't merge into an
@@ -489,6 +547,10 @@ impl Parousi {
             Message::ItemSelected(selected) => {
                 self.history.seal();
                 self.selected = selected;
+                // The panel shows the item's style, and new items' where it has
+                // none (e.g. a text size, on a shape).
+                self.selection_style = self.style.clone();
+                self.follow_selection();
             }
             Message::ItemEdited(to) => {
                 if let Some(index) = self.selected {
@@ -644,6 +706,17 @@ impl Parousi {
                     items,
                     background,
                 } = *presentation;
+
+                // Their font files can be picked for other text too.
+                for item in &items {
+                    if let Shape::Text {
+                        typeface: Typeface::File(file),
+                        ..
+                    } = &item.shape
+                    {
+                        self.add_font_file(file.clone());
+                    }
+                }
 
                 self.board_size = board_size;
                 self.frames = frames;
@@ -835,6 +908,84 @@ impl Parousi {
                 self.flight = None;
             }
         }
+
+        // E.g. undoing a change of its color, or resizing text.
+        self.follow_selection();
+    }
+
+    /// Changes the style the panel shows with `change`: the selected item's,
+    /// which changes the item, or else new items'. Like the tool, new items'
+    /// style is how the presentation is edited, so changing it isn't undone.
+    fn restyle(&mut self, change: impl FnOnce(&mut Style)) {
+        let Some(index) = self.selected else {
+            change(&mut self.style);
+            return;
+        };
+
+        change(&mut self.selection_style);
+
+        let from = self.items[index].clone();
+        let to = Item {
+            shape: from.shape.styled(&self.selection_style),
+            rotation: from.rotation,
+        };
+        self.perform(Action::ItemChanged { index, from, to });
+    }
+
+    /// Like [`Parousi::restyle`], as an edit of its own, which typing doesn't
+    /// go on with.
+    fn restyle_once(&mut self, change: impl FnOnce(&mut Style)) {
+        self.history.seal();
+        self.restyle(change);
+        self.history.seal();
+    }
+
+    /// Makes the panel show the selected item's style, keeping what is typed
+    /// in where it still holds.
+    fn follow_selection(&mut self) {
+        if let Some(item) = self.selected.and_then(|index| self.items.get(index)) {
+            self.selection_style.follow(&item.shape);
+        }
+    }
+
+    /// The style the panel shows and changes, see [`Parousi::restyle`], and
+    /// which of its settings apply.
+    fn panel_style(&self) -> (&Style, Settings) {
+        match self.selected.and_then(|index| self.items.get(index)) {
+            Some(item) => (&self.selection_style, item.shape.settings()),
+            None => (
+                &self.style,
+                Settings {
+                    color: true,
+                    fill: self.tool.can_fill(),
+                    text: self.tool == Tool::Text,
+                },
+            ),
+        }
+    }
+
+    /// Adds `file` to the fonts to pick, unless it already is, returning the
+    /// one there.
+    fn add_font_file(&mut self, file: Arc<FontFile>) -> Arc<FontFile> {
+        let typefaces = self.typefaces.options();
+
+        if let Some(added) = typefaces.iter().find_map(|typeface| match typeface {
+            Typeface::File(added) if *added == file => Some(added.clone()),
+            _ => None,
+        }) {
+            return added;
+        }
+
+        // After the default font and the other font files.
+        let at = typefaces
+            .iter()
+            .take_while(|typeface| !matches!(typeface, Typeface::System(_)))
+            .count();
+
+        let mut typefaces = typefaces.to_vec();
+        typefaces.insert(at, Typeface::File(file.clone()));
+        self.typefaces = combo_box::State::new(typefaces);
+        file
     }
 
     /// Selects `frame`, moving the camera there with the transition of the
@@ -924,27 +1075,27 @@ impl Parousi {
         let camera = self.camera();
         let board = self.board();
 
-        // A canvas draws its images over its shapes, so the background gets a
-        // canvas of its own, under the board's. Likewise, the items are split
-        // into runs that a canvas each draws in order, see
-        // [`Item::shares_canvas`].
-        let background = self.background.as_ref().map(|background| {
-            Canvas::new(BackgroundView {
+        // Under the items, the background fills the canvas in place of the
+        // board, which nothing marks out then, so only the drawings show over
+        // it, as on the exported page.
+        let backdrop: Element<'_, Message> = match &self.background {
+            Some(background) => Canvas::new(BackgroundView {
                 background,
                 board,
                 camera,
             })
             .width(Fill)
             .height(Fill)
-            .into()
-        });
-
-        let board_view = BoardView {
-            board,
-            camera,
-            see_through: self.background.is_some(),
+            .into(),
+            None => Canvas::new(BoardView { board, camera })
+                .width(Fill)
+                .height(Fill)
+                .into(),
         };
 
+        // A canvas draws its images over its shapes, so the items are split
+        // into runs that a canvas each draws in order, see
+        // [`Item::shares_canvas`].
         let items = self.items.chunk_by(Item::shares_canvas).map(|items| {
             Canvas::new(ItemsView { camera, items })
                 .width(Fill)
@@ -960,15 +1111,12 @@ impl Parousi {
             selected: self.selected,
             mode: self.mode,
             tool: self.tool,
-            color: self.ink.color,
-            filled: self.filled,
+            style: &self.style,
             corners: self.corners.count,
         };
 
         let layers = Stack::with_children(
-            background
-                .into_iter()
-                .chain([Canvas::new(board_view).width(Fill).height(Fill).into()])
+            iter::once(backdrop)
                 .chain(items)
                 .chain([Canvas::new(tool).width(Fill).height(Fill).into()]),
         )
@@ -1010,7 +1158,8 @@ impl Parousi {
                     .size(20)
                     .width(Fill)
                     .align_x(Horizontal::Center),
-                Column::with_children(sections.chain([self.color_picker()])).spacing(20),
+                Column::with_children(sections.chain([self.color_picker(), self.text_settings()]))
+                    .spacing(20),
             ]
             .spacing(16)
             .padding(16),
@@ -1038,13 +1187,19 @@ impl Parousi {
     /// The preset colors to draw in, an input for any other, and whether to
     /// fill closed shapes in with it.
     fn color_picker(&self) -> Element<'_, Message> {
+        let (style, settings) = self.panel_style();
+
         let swatches = COLORS.chunks(6).map(|colors| {
-            Row::with_children(colors.iter().map(|&color| self.swatch(color)))
-                .spacing(8)
-                .into()
+            Row::with_children(
+                colors
+                    .iter()
+                    .map(|&color| swatch(color, &style.ink, settings.color)),
+            )
+            .spacing(8)
+            .into()
         });
 
-        let color = self.ink.color;
+        let color = style.ink.color;
         let shown = container(space())
             .width(30)
             .height(30)
@@ -1054,22 +1209,79 @@ impl Parousi {
                 ..container::Style::default()
             });
 
-        let input = text_input("#rrggbb", &self.ink.input)
-            .on_input(Message::ColorInputChanged)
-            .style(input_style(self.ink.is_valid()));
+        let input = text_input("#rrggbb", &style.ink.input)
+            .on_input_maybe(settings.color.then_some(Message::ColorInputChanged))
+            .style(input_style(style.ink.is_valid()));
 
-        let filled = checkbox(self.filled)
+        let filled = checkbox(style.filled)
             .label("Filled")
-            .on_toggle_maybe(self.tool.can_fill().then_some(Message::FilledToggled));
+            .on_toggle_maybe(settings.fill.then_some(Message::FilledToggled));
 
         column![
-            text("Color").size(14),
+            self.style_title("Color"),
             Column::with_children(swatches).spacing(8),
             row![shown, input].spacing(8).align_y(Center),
             filled,
         ]
         .spacing(8)
         .into()
+    }
+
+    /// The size and font to write text in, and a button to load a font from a
+    /// file.
+    fn text_settings(&self) -> Element<'_, Message> {
+        let (style, settings) = self.panel_style();
+        let enabled = settings.text;
+
+        let size = text_input("", &style.text_size.input)
+            .on_input_maybe(enabled.then_some(Message::TextSizeChanged))
+            .style(input_style(style.text_size.is_valid()));
+
+        // A combo box can't be disabled, so a disabled input shows the font
+        // instead.
+        let font: Element<'_, Message> = if enabled {
+            combo_box(
+                &self.typefaces,
+                "Font",
+                Some(&style.typeface),
+                Message::TypefacePicked,
+            )
+            .menu_height(FONT_MENU_HEIGHT)
+            .into()
+        } else {
+            text_input("Font", &style.typeface.to_string()).into()
+        };
+
+        let file = button(text("Font file").width(Fill).center())
+            .width(Fill)
+            .style(button::secondary)
+            .on_press_maybe(enabled.then_some(Message::PickFontFile));
+
+        column![
+            self.style_title("Text"),
+            row![text("Size"), size].spacing(8).align_y(Center),
+            font,
+            file,
+        ]
+        .spacing(8)
+        .into()
+    }
+
+    /// Title of a section of the panel setting the style, which tells when it
+    /// is the selected item's.
+    fn style_title<'a>(&self, title: &'a str) -> Element<'a, Message> {
+        let title = text(title).size(14);
+
+        if self.selected.is_some() {
+            row![
+                title,
+                space::horizontal(),
+                text("Selected item").size(14).style(text::secondary),
+            ]
+            .into()
+        } else {
+            title.into()
+        }
     }
 
     /// Input of the corners of polygons and points of stars, which only
@@ -1084,39 +1296,6 @@ impl Parousi {
         row![text("Corners"), input]
             .spacing(8)
             .align_y(Center)
-            .into()
-    }
-
-    fn swatch(&self, color: Color) -> Element<'_, Message> {
-        let is_picked = self.ink.color == color;
-
-        button(space())
-            .width(Fill)
-            .height(30)
-            .padding(0)
-            .style(move |theme: &Theme, status| {
-                let border = if is_picked {
-                    // Contrasting with the swatch rather than the panel shows
-                    // on any color.
-                    let ring = if color.relative_luminance() > 0.4 {
-                        Color::BLACK
-                    } else {
-                        Color::WHITE
-                    };
-                    swatch_border(theme).color(ring).width(3)
-                } else if status == button::Status::Hovered {
-                    swatch_border(theme).color(theme.extended_palette().background.base.text)
-                } else {
-                    swatch_border(theme)
-                };
-
-                button::Style {
-                    background: Some(color.into()),
-                    border,
-                    ..button::Style::default()
-                }
-            })
-            .on_press(Message::ColorPicked(color))
             .into()
     }
 
@@ -1302,6 +1481,47 @@ impl Parousi {
 /// Color around the board, where neither it nor the background is.
 fn workspace_color(theme: &Theme) -> Color {
     theme.extended_palette().background.weakest.color
+}
+
+/// A button picking `color` to draw in, ringed while `ink` is in it. It
+/// shows dimmed, picking nothing, unless `enabled`.
+fn swatch<'a>(color: Color, ink: &Ink, enabled: bool) -> Element<'a, Message> {
+    let is_picked = enabled && ink.color == color;
+
+    button(space())
+        .width(Fill)
+        .height(30)
+        .padding(0)
+        .style(move |theme: &Theme, status| {
+            let border = if is_picked {
+                // Contrasting with the swatch rather than the panel shows on
+                // any color.
+                let ring = if color.relative_luminance() > 0.4 {
+                    Color::BLACK
+                } else {
+                    Color::WHITE
+                };
+                swatch_border(theme).color(ring).width(3)
+            } else if status == button::Status::Hovered {
+                swatch_border(theme).color(theme.extended_palette().background.base.text)
+            } else {
+                swatch_border(theme)
+            };
+
+            let background = if status == button::Status::Disabled {
+                color.scale_alpha(DISABLED_ALPHA)
+            } else {
+                color
+            };
+
+            button::Style {
+                background: Some(background.into()),
+                border,
+                ..button::Style::default()
+            }
+        })
+        .on_press_maybe(enabled.then_some(Message::ColorPicked(color)))
+        .into()
 }
 
 /// Outline of a color swatch, which shows it apart from the panel even when
@@ -1734,16 +1954,8 @@ impl History {
     }
 }
 
-/// Fill of the board when no background shows through it.
+/// Fill of the board, which only shows without a background.
 const BOARD_COLOR: Color = Color::WHITE;
-
-/// Lines, with their widths in screen pixels, outlining the board when the
-/// background shows through it. A light line over a dark one shows on any
-/// background.
-const BOARD_OUTLINE: [(Color, f32); 2] = [
-    (Color::from_rgba(0.0, 0.0, 0.0, 0.4), 3.0),
-    (Color::from_rgba(1.0, 1.0, 1.0, 0.8), 1.0),
-];
 
 const MIN_ZOOM: f32 = 0.1;
 const MAX_ZOOM: f32 = 10.0;
@@ -1997,7 +2209,64 @@ const COLORS: [Color; 12] = [
 
 const DEFAULT_COLOR: Color = Color::from_rgb8(0x25, 0x63, 0xEB);
 
-/// The color new items are drawn in.
+/// Opacity of a color swatch that can't be picked.
+const DISABLED_ALPHA: f32 = 0.3;
+
+/// How items are drawn, as the panel sets it, for new items or the selected
+/// one. Each setting only applies to some items, see [`Settings`].
+#[derive(Debug, Clone, PartialEq)]
+struct Style {
+    ink: Ink,
+    /// Whether closed shapes are filled in, rather than outlined.
+    filled: bool,
+    text_size: TextSize,
+    typeface: Typeface,
+}
+
+impl Default for Style {
+    fn default() -> Self {
+        Self {
+            ink: Ink::default(),
+            filled: false,
+            text_size: TextSize::new(TEXT_SIZE),
+            typeface: Typeface::Default,
+        }
+    }
+}
+
+impl Style {
+    /// Takes on the settings `shape` has, keeping the inputs that still hold
+    /// its values.
+    fn follow(&mut self, shape: &Shape) {
+        if let Some(color) = shape.color()
+            && color != self.ink.color
+        {
+            self.ink = Ink::new(color);
+        }
+
+        if let Some(filled) = shape.filled() {
+            self.filled = filled;
+        }
+
+        if let Some((size, typeface)) = shape.text_style() {
+            if size != self.text_size.value {
+                self.text_size = TextSize::new(size);
+            }
+            self.typeface = typeface.clone();
+        }
+    }
+}
+
+/// Which settings of a [`Style`] apply, and can be changed in the panel.
+#[derive(Debug, Clone, Copy)]
+struct Settings {
+    color: bool,
+    fill: bool,
+    /// The size and font of text.
+    text: bool,
+}
+
+/// A color, as typed into its input.
 #[derive(Debug, Clone, PartialEq)]
 struct Ink {
     color: Color,
@@ -2100,8 +2369,53 @@ const ARROW_HEAD_WIDTH: f32 = 12.0;
 /// Distance of a star's dents from its center, relative to its points'.
 const STAR_DENT: f32 = 0.5;
 
-/// Size of new text.
+/// Size of new text, until another is set.
 const TEXT_SIZE: f32 = 32.0;
+
+/// Largest size text can be set to. Text can still be resized past it.
+const MAX_TEXT_SIZE: f32 = 1000.0;
+
+/// Height of the list of fonts to pick from.
+const FONT_MENU_HEIGHT: f32 = 300.0;
+
+/// A text size, as typed into its input.
+#[derive(Debug, Clone, PartialEq)]
+struct TextSize {
+    value: f32,
+    /// It may not be a valid size (e.g. mid-edit), in which case `value`
+    /// keeps the last valid one.
+    input: String,
+}
+
+impl TextSize {
+    fn new(value: f32) -> Self {
+        Self {
+            value,
+            // Resizing leaves sizes with digits no one would type.
+            input: ((value * 100.0).round() / 100.0).to_string(),
+        }
+    }
+
+    fn set_input(&mut self, input: String) {
+        if let Some(value) = parse_text_size(&input) {
+            self.value = value;
+        }
+        self.input = input;
+    }
+
+    fn is_valid(&self) -> bool {
+        parse_text_size(&self.input).is_some()
+    }
+}
+
+/// Parses a text size, positive and up to [`MAX_TEXT_SIZE`].
+fn parse_text_size(input: &str) -> Option<f32> {
+    input
+        .trim()
+        .parse()
+        .ok()
+        .filter(|&size| size > 0.0 && size <= MAX_TEXT_SIZE)
+}
 
 /// Height of a line of text, relative to its size.
 const TEXT_LINE_HEIGHT: f32 = 1.2;
@@ -2220,6 +2534,7 @@ enum Shape {
         position: Point,
         content: String,
         size: f32,
+        typeface: Typeface,
         color: Color,
     },
     Image {
@@ -2264,6 +2579,7 @@ impl Shape {
                 position,
                 content,
                 size,
+                typeface,
                 color,
             } => frame.fill_text(canvas::Text {
                 content: content.clone(),
@@ -2271,7 +2587,7 @@ impl Shape {
                 color: *color,
                 size: (*size).into(),
                 line_height: LineHeight::Relative(TEXT_LINE_HEIGHT),
-                font: Font::DEFAULT,
+                font: typeface.font(),
                 ..canvas::Text::default()
             }),
             Shape::Image { bounds, picture } => {
@@ -2335,11 +2651,13 @@ impl Shape {
                 position,
                 content,
                 size,
+                typeface,
                 color,
             } => Shape::Text {
                 position: map(position),
                 content,
                 size: size * factors.x,
+                typeface,
                 color,
             },
             Shape::Image { bounds, picture } => Shape::Image {
@@ -2358,6 +2676,83 @@ impl Shape {
         matches!(self, Shape::Text { .. })
     }
 
+    /// The color the shape is drawn in, unless it is an image.
+    fn color(&self) -> Option<Color> {
+        match self {
+            Shape::Polyline { color, .. }
+            | Shape::Arrow { color, .. }
+            | Shape::Ellipse { color, .. }
+            | Shape::Text { color, .. } => Some(*color),
+            Shape::Image { .. } => None,
+        }
+    }
+
+    /// Whether the shape is filled in, if it is closed.
+    fn filled(&self) -> Option<bool> {
+        match self {
+            Shape::Polyline {
+                closed: true,
+                filled,
+                ..
+            }
+            | Shape::Ellipse { filled, .. } => Some(*filled),
+            _ => None,
+        }
+    }
+
+    /// The size and font of text.
+    fn text_style(&self) -> Option<(f32, &Typeface)> {
+        match self {
+            Shape::Text { size, typeface, .. } => Some((*size, typeface)),
+            _ => None,
+        }
+    }
+
+    /// Which settings of a [`Style`] apply to the shape.
+    fn settings(&self) -> Settings {
+        Settings {
+            color: self.color().is_some(),
+            fill: self.filled().is_some(),
+            text: self.text_style().is_some(),
+        }
+    }
+
+    /// The shape drawn in `style`, as far as its [settings](Self::settings)
+    /// go. Text keeps the top left corner of its first line in place.
+    fn styled(&self, style: &Style) -> Shape {
+        let mut shape = self.clone();
+
+        match &mut shape {
+            Shape::Polyline {
+                closed,
+                filled,
+                color,
+                ..
+            } => {
+                *filled = *closed && style.filled;
+                *color = style.ink.color;
+            }
+            Shape::Arrow { color, .. } => *color = style.ink.color,
+            Shape::Ellipse { filled, color, .. } => {
+                *filled = style.filled;
+                *color = style.ink.color;
+            }
+            Shape::Text {
+                size,
+                typeface,
+                color,
+                ..
+            } => {
+                *size = style.text_size.value;
+                *typeface = style.typeface.clone();
+                *color = style.ink.color;
+            }
+            Shape::Image { .. } => {}
+        }
+
+        shape
+    }
+
     /// The smallest rectangle the shape's points fit in, not counting the
     /// thickness of lines or arrowheads, so it resizes with the shape.
     fn extent(&self) -> Rectangle {
@@ -2371,8 +2766,9 @@ impl Shape {
                 position,
                 content,
                 size,
+                typeface,
                 ..
-            } => Rectangle::new(*position, text_size(content, *size)),
+            } => Rectangle::new(*position, text_size(content, *size, typeface.font())),
             Shape::Image { bounds, .. } => *bounds,
         }
     }
@@ -2600,14 +2996,14 @@ fn polygon(center: Point, corner: Point, corners: usize, dent: Option<f32>) -> V
         .collect()
 }
 
-/// Size of `content` as text of `size` draws it.
-fn text_size(content: &str, size: f32) -> Size {
+/// Size of `content` as text of `size` in `font` draws it.
+fn text_size(content: &str, size: f32, font: Font) -> Size {
     <Renderer as advanced_text::Renderer>::Paragraph::with_text(advanced_text::Text {
         content,
         bounds: Size::INFINITE,
         size: size.into(),
         line_height: LineHeight::Relative(TEXT_LINE_HEIGHT),
-        font: Font::DEFAULT,
+        font,
         align_x: advanced_text::Alignment::Default,
         align_y: Vertical::Top,
         shaping: advanced_text::Shaping::default(),
@@ -2619,7 +3015,7 @@ fn text_size(content: &str, size: f32) -> Size {
 /// The largest rectangle with the aspect ratio of `size` that fits in
 /// `area`, centered in it.
 fn fit(size: Size, area: Rectangle) -> Rectangle {
-    let fitted = size * (area.width / size.width).min(area.height / size.height);
+    let fitted = size * fit_scale(size, area.size());
     Rectangle::new(
         area.center() - Vector::new(fitted.width, fitted.height) * 0.5,
         fitted,
@@ -2630,9 +3026,21 @@ fn fit(size: Size, area: Rectangle) -> Rectangle {
 /// [`Background::parallax`].
 const DEFAULT_PARALLAX: f32 = 10.0;
 
-/// Highest parallax, in percent, which bounds how large a vector background
-/// is rasterized, see [`background_scale`].
+/// Highest parallax, in percent.
 const MAX_PARALLAX: f32 = 100.0;
+
+/// Power of the camera's zoom the background zooms in by, see
+/// [`background_zoom`]. At a half, it zooms in 2× as the board does 4×, so it
+/// looks far behind it. At 1, it would zoom in as much as the board.
+const BACKGROUND_ZOOM_POWER: f32 = 0.5;
+
+/// Most the background is drawn at however close the camera zooms in, in
+/// times the scale that covers the screen, which bounds how large a vector
+/// background is rasterized, see [`background_scale`]. An 8K image covering
+/// a 4K screen then shows each of its pixels across 4 of the screen's, or 2
+/// of a 1080p screen's, and a 4K image twice that: soft, but still fine for
+/// a backdrop. It is at least the scale zoomed out at [`MAX_PARALLAX`], 2.
+const MAX_BACKGROUND_SCALE: f32 = 8.0;
 
 /// Size, in pixels, of the largest screen a vector background is rasterized
 /// to look sharp on: a 4K one.
@@ -2649,20 +3057,38 @@ const RASTER_EXTENSIONS: &[&str] = &[
 /// [`rasterize_svg`].
 const VECTOR_EXTENSIONS: &[&str] = &["svg", "svgz"];
 
-/// Longest side, in pixels, of a rasterized vector image. Only very wide or
-/// tall images reach it, which would take up gigabytes otherwise.
+/// Longest side, in pixels, of a rasterized vector image, which would take up
+/// gigabytes otherwise. A background zoomed in as far as it goes on a 4K
+/// screen reaches it, as do very wide or tall images.
 const MAX_RASTER_SIDE: f32 = 8192.0;
 
-/// Pixels per unit to rasterize a vector background of `size` at: the size
-/// it is drawn at on [`SHARPEST_SCREEN`] with the highest parallax, so it
-/// never shows blurry, however the parallax is set.
+/// Pixels per unit to rasterize a vector background of `size` at: the most
+/// it is drawn at on [`SHARPEST_SCREEN`], so it doesn't show blurry, however
+/// the parallax is set and the camera zooms, up to [`MAX_RASTER_SIDE`].
 fn background_scale(size: Size) -> f32 {
-    cover_scale(size, SHARPEST_SCREEN) * (1.0 + MAX_PARALLAX / 100.0)
+    cover_scale(size, SHARPEST_SCREEN) * MAX_BACKGROUND_SCALE
+}
+
+/// How many times larger than zoomed out the background is drawn, with
+/// `parallax` from 0 to 1 and the camera `zoom` times as close as the one
+/// that fits the board on screen. Like a far scene, it zooms in by
+/// [`BACKGROUND_ZOOM_POWER`] of the camera's zoom. Zoomed out further than
+/// the whole board, it shrinks no more, so its edges never show, and zoomed
+/// in, it grows up to [`MAX_BACKGROUND_SCALE`].
+fn background_zoom(zoom: f32, parallax: f32) -> f32 {
+    zoom.powf(BACKGROUND_ZOOM_POWER)
+        .min(MAX_BACKGROUND_SCALE / (1.0 + parallax))
+        .max(1.0)
 }
 
 /// Scale that makes something of `size` cover `area` without stretching.
 fn cover_scale(size: Size, area: Size) -> f32 {
     (area.width / size.width).max(area.height / size.height)
+}
+
+/// Scale that makes something of `size` fit in `area` without stretching.
+fn fit_scale(size: Size, area: Size) -> f32 {
+    (area.width / size.width).min(area.height / size.height)
 }
 
 /// Asks for an image file and loads it, see [`load_picture`].
@@ -2835,7 +3261,8 @@ impl Picture {
     }
 }
 
-/// The image filling the screen behind the board, and how far it drifts.
+/// The image filling the screen in place of the board, and how far it
+/// drifts.
 #[derive(Debug, Clone, PartialEq)]
 struct Background {
     picture: Picture,
@@ -2867,8 +3294,8 @@ impl Background {
     }
 }
 
-/// Draws the background over the whole canvas, drifting with the camera of
-/// the board drawn over it.
+/// Draws the background over the whole canvas, drifting and zooming with the
+/// camera the items are drawn through.
 struct BackgroundView<'a> {
     background: &'a Background,
     board: Board,
@@ -2894,8 +3321,14 @@ impl canvas::Program<Message> for BackgroundView<'_> {
         // either way. Along a side the screen crops more off, it drifts no
         // further, so it drifts alike in any shape of window.
         let parallax = self.background.parallax / 100.0;
-        let size = image * (cover_scale(image, screen) * (1.0 + parallax));
         let room = Vector::new(screen.width, screen.height) * (parallax * 0.5);
+
+        // Zoomed in closer than the whole board, it grows too.
+        let zoom = background_zoom(
+            self.camera.zoom / fit_scale(self.board.size, screen),
+            parallax,
+        );
+        let size = image * (cover_scale(image, screen) * (1.0 + parallax) * zoom);
 
         // Where the camera looks across the board, from -1 at one side to 1
         // at the other. Looking further out takes it no further.
@@ -2906,8 +3339,10 @@ impl canvas::Program<Message> for BackgroundView<'_> {
             (center.y / half.height).clamp(-1.0, 1.0),
         );
 
-        // Like a far scene, it shifts the way the board does.
-        let middle = frame.center() - Vector::new(across.x * room.x, across.y * room.y);
+        // Like a far scene, it shifts the way the board does. It grows around
+        // the middle of the screen, so the point there stays put, and its
+        // shift grows with it, which leaves its edges as far out of sight.
+        let middle = frame.center() - Vector::new(across.x * room.x, across.y * room.y) * zoom;
         let top_left = middle - Vector::new(size.width, size.height) * 0.5;
 
         frame.draw_image(
@@ -2919,13 +3354,11 @@ impl canvas::Program<Message> for BackgroundView<'_> {
     }
 }
 
-/// Draws the board through the camera, under the items.
+/// Draws the board through the camera, under the items, while there is no
+/// background.
 struct BoardView {
     board: Board,
     camera: Camera,
-    /// Whether the background shows through the board, which is then
-    /// outlined rather than filled white.
-    see_through: bool,
 }
 
 impl canvas::Program<Message> for BoardView {
@@ -2947,22 +3380,7 @@ impl canvas::Program<Message> for BoardView {
         let top_left = Point::ORIGIN - Vector::new(size.width, size.height) * 0.5;
         // Not `fill_rectangle`, which the wgpu renderer keeps axis-aligned,
         // squashing the board when the camera is turned.
-        let board = canvas::Path::rectangle(top_left, size);
-
-        if self.see_through {
-            for (color, width) in BOARD_OUTLINE {
-                // As thick at any zoom.
-                let width = width / self.camera.zoom;
-                frame.stroke(
-                    &board,
-                    canvas::Stroke::default()
-                        .with_color(color)
-                        .with_width(width),
-                );
-            }
-        } else {
-            frame.fill(&board, BOARD_COLOR);
-        }
+        frame.fill(&canvas::Path::rectangle(top_left, size), BOARD_COLOR);
 
         vec![frame.into_geometry()]
     }
@@ -3210,10 +3628,9 @@ struct ToolView<'a> {
     selected: Option<usize>,
     mode: Mode,
     tool: Tool,
-    /// Color new items are drawn in.
-    color: Color,
-    /// Whether new closed shapes are filled in, see [`Tool::can_fill`].
-    filled: bool,
+    /// How new items are drawn. Closed shapes are filled in as it says, see
+    /// [`Tool::can_fill`].
+    style: &'a Style,
     /// Corners of new polygons, and points of new stars.
     corners: usize,
 }
@@ -3234,11 +3651,11 @@ impl ToolView<'_> {
 
     /// The item `draft` makes so far, unless it would be empty.
     fn item(&self, draft: &Draft) -> Option<Item> {
-        let color = self.color;
+        let color = self.style.ink.color;
 
         let shape = match draft {
             Draft::Drag { tool, start, end } => {
-                shape(*tool, *start, *end, self.corners, color, self.filled)
+                shape(*tool, *start, *end, self.corners, color, self.style.filled)
             }
             Draft::Stroke(points) | Draft::Path { points, .. } => {
                 (points.len() > 1).then(|| Shape::Polyline {
@@ -3252,7 +3669,8 @@ impl ToolView<'_> {
                 (!content.trim().is_empty()).then(|| Shape::Text {
                     position: *position,
                     content: content.clone(),
-                    size: TEXT_SIZE,
+                    size: self.style.text_size.value,
+                    typeface: self.style.typeface.clone(),
                     color,
                 })
             }
@@ -3515,8 +3933,8 @@ impl ToolView<'_> {
                     canvas::Action::publish(Message::ItemDrawn(Item::new(Shape::Polyline {
                         points,
                         closed: true,
-                        filled: self.filled,
-                        color: self.color,
+                        filled: self.style.filled,
+                        color: self.style.ink.color,
                     })))
                 } else if click.kind() == click::Kind::Double {
                     let draft = state.draft.take()?;
@@ -3842,8 +4260,9 @@ impl canvas::Program<Message> for ToolView<'_> {
                 item.draw(&mut frame);
             }
 
+            let color = self.style.ink.color;
             let mark = canvas::Stroke::default()
-                .with_color(self.color)
+                .with_color(color)
                 .with_width(pixel);
 
             match draft {
@@ -3867,7 +4286,7 @@ impl canvas::Program<Message> for ToolView<'_> {
                 }
                 Draft::Path { points, cursor } => {
                     if let Some(last) = points.last() {
-                        frame.stroke(&canvas::Path::line(*last, *cursor), stroke(self.color));
+                        frame.stroke(&canvas::Path::line(*last, *cursor), stroke(color));
                     }
 
                     // Where clicking closes the path.
@@ -3881,9 +4300,10 @@ impl canvas::Program<Message> for ToolView<'_> {
                 Draft::Text { position, content } => {
                     // After the last character, as text doesn't wrap.
                     let (row, line) = content.split('\n').enumerate().last().unwrap_or_default();
-                    let line_height = TEXT_SIZE * TEXT_LINE_HEIGHT;
-                    let top = *position
-                        + Vector::new(text_size(line, TEXT_SIZE).width, row as f32 * line_height);
+                    let size = self.style.text_size.value;
+                    let line_height = size * TEXT_LINE_HEIGHT;
+                    let width = text_size(line, size, self.style.typeface.font()).width;
+                    let top = *position + Vector::new(width, row as f32 * line_height);
 
                     frame.stroke(
                         &canvas::Path::line(top, top + Vector::new(0.0, line_height)),

@@ -13,9 +13,10 @@ use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader, ImageResult, R
 use resvg::usvg;
 use serde_json::{Value, json};
 
+use crate::typeface::{FontFile, Typeface};
 use crate::{
-    BOARD_COLOR, Item, LINE_WIDTH, Presentation, Shape, TEXT_LINE_HEIGHT, THEME, TransitionKind,
-    arrow_head, workspace_color,
+    BACKGROUND_ZOOM_POWER, BOARD_COLOR, Item, LINE_WIDTH, MAX_BACKGROUND_SCALE, Presentation,
+    Shape, TEXT_LINE_HEIGHT, THEME, TransitionKind, arrow_head, workspace_color,
 };
 
 /// The page, which draws the presentation like the editor does. Its script
@@ -134,10 +135,11 @@ impl Presentation {
             })
             .collect();
 
+        let mut fonts = Fonts::default();
         let items = self
             .items
             .iter()
-            .map(item_json)
+            .map(|item| item_json(item, &mut fonts))
             .collect::<io::Result<Vec<_>>>()?;
 
         let background = match &self.background {
@@ -148,6 +150,8 @@ impl Presentation {
                     "url": background.picture.file.to_url()?,
                     "size": [size.width, size.height],
                     "parallax": background.parallax,
+                    "zoomPower": BACKGROUND_ZOOM_POWER,
+                    "maxScale": MAX_BACKGROUND_SCALE,
                 })
             }
             None => Value::Null,
@@ -167,6 +171,7 @@ impl Presentation {
             "text": {
                 "lineHeight": TEXT_LINE_HEIGHT,
             },
+            "fonts": fonts.to_json(),
             "background": background,
             "workspace": workspace_color(&THEME).to_string(),
         });
@@ -177,10 +182,72 @@ impl Presentation {
     }
 }
 
+/// The font files the page embeds, each once however much text is written in
+/// it.
+#[derive(Default)]
+struct Fonts(Vec<Arc<FontFile>>);
+
+impl Fonts {
+    /// The CSS font families text in `typeface` is written in, falling back
+    /// to the default where the font is missing. A font file is embedded
+    /// unless it already is.
+    fn families(&mut self, typeface: &Typeface) -> String {
+        let family = match typeface {
+            Typeface::Default => return String::from(DEFAULT_FAMILY),
+            Typeface::System(family) => css_string(family),
+            Typeface::File(file) => {
+                let index = match self.0.iter().position(|added| added == file) {
+                    Some(index) => index,
+                    None => {
+                        self.0.push(file.clone());
+                        self.0.len() - 1
+                    }
+                };
+                css_string(&embedded_family(index))
+            }
+        };
+
+        format!("{family}, {DEFAULT_FAMILY}")
+    }
+
+    /// The embedded fonts, as the page loads them.
+    fn to_json(&self) -> Vec<Value> {
+        self.0
+            .iter()
+            .enumerate()
+            .map(|(index, file)| {
+                json!({
+                    "family": embedded_family(index),
+                    "url": format!(
+                        "data:font/{};base64,{}",
+                        file.extension(),
+                        BASE64.encode(&file.data),
+                    ),
+                })
+            })
+            .collect()
+    }
+}
+
+/// The CSS font family text falls back to, like the editor's default font.
+const DEFAULT_FAMILY: &str = "sans-serif";
+
+/// Family the page names the embedded font file `index` by, apart from any
+/// installed font of the family it goes by.
+fn embedded_family(index: usize) -> String {
+    format!("parousi-font-{index}")
+}
+
+/// `value` as a quoted CSS string.
+fn css_string(value: &str) -> String {
+    format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
 /// `item` as the page draws it: its shape, in its own coordinates, turned by
 /// its rotation around the board center. Arrows come as the shapes they are
-/// drawn with, so the page doesn't work them out again.
-fn item_json(item: &Item) -> io::Result<Value> {
+/// drawn with, so the page doesn't work them out again. Text names its font
+/// as CSS does, embedding a font file in `fonts`.
+fn item_json(item: &Item, fonts: &mut Fonts) -> io::Result<Value> {
     let point = |point: Point| json!([point.x, point.y]);
 
     let mut json = match &item.shape {
@@ -221,12 +288,14 @@ fn item_json(item: &Item) -> io::Result<Value> {
             position,
             content,
             size,
+            typeface,
             color,
         } => json!({
             "type": "text",
             "position": point(*position),
             "content": content,
             "size": size,
+            "font": fonts.families(typeface),
             "color": color.to_string(),
         }),
         Shape::Image { bounds, picture } => json!({
